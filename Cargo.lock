@@ -721,6 +721,8 @@ dependencies = [
  "anyhow",
  "clap",
  "proteus-core",
+ "quinn",
+ "tokio",
 ]
 
 [[package]]
@@ -728,8 +730,13 @@ name = "proteus-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
+ "quinn",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_yaml",
+ "sha2",
 ]
 
 [[package]]
@@ -739,6 +746,8 @@ dependencies = [
  "anyhow",
  "clap",
  "proteus-core",
+ "quinn",
+ "tokio",
 ]
 
 [[package]]

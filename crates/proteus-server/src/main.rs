@@ -1,13 +1,14 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M1: load YAML config, print parsed values, exit. M3 wires the QUIC
-//! listener; M6 wires auth; M12 wires policy; M13 wires the decoy.
+//! M3: bind UDP, accept QUIC connections, expect a single bidi stream
+//! per connection carrying the bytes `ping`, reply `pong`. No auth,
+//! no policy, no decoy yet — those land in M6/M12/M13.
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use proteus_core::config::ServerConfig;
+use proteus_core::{config::ServerConfig, tls};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -23,34 +24,48 @@ struct Cli {
     config: PathBuf,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = ServerConfig::from_yaml_file(&cli.config)?;
 
-    println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
-    println!("config:     {}", cli.config.display());
-    println!("listen:     {}", cfg.listen.addr);
-    println!("log_level:  {}", cfg.log_level);
-    println!("tls:        {}", section_status(cfg.tls.is_some(), "M6"));
-    println!(
-        "clients:    {}",
-        section_status(cfg.clients.is_some(), "M2/M6")
-    );
-    println!(
-        "policy:     {}",
-        section_status(cfg.policy.is_some(), "M12")
-    );
-    println!("decoy:      {}", section_status(cfg.decoy.is_some(), "M13"));
-    println!();
-    println!("M1 stub — config parsed OK. No listener yet (lands in M3).");
+    tls::install_crypto_provider();
+    let (qcfg, cert) = tls::server_config(cfg.tls.as_ref())?;
+    let endpoint = quinn::Endpoint::server(qcfg, cfg.listen.addr)
+        .with_context(|| format!("bind {}", cfg.listen.addr))?;
 
+    println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
+    println!("listening on: {}", endpoint.local_addr()?);
+    println!("cert sha256:  {}", tls::cert_sha256_hex(&cert));
+    println!();
+    println!("M3: plain QUIC ping/pong. No auth/policy/decoy yet. Ctrl-C to stop.");
+
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(async move {
+            if let Err(e) = handle_conn(incoming).await {
+                eprintln!("conn error: {e:#}");
+            }
+        });
+    }
     Ok(())
 }
 
-fn section_status(present: bool, milestone: &str) -> String {
-    if present {
-        format!("present (activated in {milestone})")
-    } else {
-        format!("absent  (activated in {milestone})")
+async fn handle_conn(incoming: quinn::Incoming) -> Result<()> {
+    let conn = incoming.await.context("handshake")?;
+    let peer = conn.remote_address();
+    println!("accepted {peer}");
+
+    let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi")?;
+    let mut buf = [0u8; 4];
+    recv.read_exact(&mut buf).await.context("read ping")?;
+    if &buf != b"ping" {
+        anyhow::bail!("{peer}: expected b\"ping\", got {:?}", &buf);
     }
+    send.write_all(b"pong").await.context("write pong")?;
+    send.finish().context("finish send")?;
+    println!("ping/pong with {peer} OK");
+
+    // Wait for client to close before we drop the connection.
+    let _ = conn.closed().await;
+    Ok(())
 }
