@@ -2,11 +2,19 @@
 name = "proteus-tools"
 version = "0.1.0"
 edition = "2024"
+default-run = "proteus-tools"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
 quinn = "0.11"
+rand = "0.8"
 rcgen = "0.13"
 rustls = "0.23"
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
