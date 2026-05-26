@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proteus-core",
+    "crates/proteus-server",
+    "crates/proteus-client",
+    "crates/proteus-tools",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"

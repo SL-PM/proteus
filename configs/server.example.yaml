@@ -1,0 +1,22 @@
+# PROTEUS server config (v0.3 prototype)
+# Placeholder for M0. Schema lands in M1.
+
+listen:
+  addr: "0.0.0.0:4433"
+
+tls:
+  # Self-signed acceptable for v0.3 lab. Replace for any deployment.
+  cert: "configs/server-cert.pem"
+  key: "configs/server-key.pem"
+
+clients:
+  # client_id -> base64 ed25519 public key
+  # Populated by `proteus-tools keygen` (M2).
+
+policy:
+  block_private_ranges: true
+  allowed_ports: [80, 443, 8080]
+  allow_udp: false
+
+decoy:
+  static_page: "configs/decoy.html"

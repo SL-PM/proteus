@@ -1,0 +1,15 @@
+# PROTEUS client config (v0.3 prototype)
+# Placeholder for M0. Schema lands in M1.
+
+server:
+  addr: "127.0.0.1:4433"
+  sni: "localhost"
+  # Pin server cert SHA-256 in v0.3 (no PKI trust chain assumed).
+  cert_sha256: ""
+
+identity:
+  client_id: "alice"
+  private_key: "configs/alice-priv.key"
+
+socks5:
+  listen: "127.0.0.1:1080"
