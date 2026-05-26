@@ -719,6 +719,7 @@ name = "proteus-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "proteus-core",
  "quinn",
@@ -730,6 +731,7 @@ name = "proteus-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "hex",
  "quinn",
  "rcgen",
@@ -737,6 +739,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -744,6 +747,7 @@ name = "proteus-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "proteus-core",
  "quinn",

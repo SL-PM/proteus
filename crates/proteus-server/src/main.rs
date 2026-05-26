@@ -1,14 +1,19 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M3: bind UDP, accept QUIC connections, expect a single bidi stream
-//! per connection carrying the bytes `ping`, reply `pong`. No auth,
-//! no policy, no decoy yet — those land in M6/M12/M13.
+//! M4: bind UDP, accept QUIC connections, expect a single PROTEUS PING
+//! frame on the first bidi stream of each connection, reply PONG. No
+//! auth, no policy, no decoy yet — those land in M6/M12/M13.
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use clap::Parser;
-use proteus_core::{config::ServerConfig, tls};
+use proteus_core::{
+    config::ServerConfig,
+    frame::{Frame, FrameType, read_frame, write_frame},
+    tls,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,7 +43,7 @@ async fn main() -> Result<()> {
     println!("listening on: {}", endpoint.local_addr()?);
     println!("cert sha256:  {}", tls::cert_sha256_hex(&cert));
     println!();
-    println!("M3: plain QUIC ping/pong. No auth/policy/decoy yet. Ctrl-C to stop.");
+    println!("M4: framed PING/PONG over QUIC. No auth/policy/decoy yet. Ctrl-C to stop.");
 
     while let Some(incoming) = endpoint.accept().await {
         tokio::spawn(async move {
@@ -56,16 +61,17 @@ async fn handle_conn(incoming: quinn::Incoming) -> Result<()> {
     println!("accepted {peer}");
 
     let (mut send, mut recv) = conn.accept_bi().await.context("accept_bi")?;
-    let mut buf = [0u8; 4];
-    recv.read_exact(&mut buf).await.context("read ping")?;
-    if &buf != b"ping" {
-        anyhow::bail!("{peer}: expected b\"ping\", got {:?}", &buf);
+    let ping = read_frame(&mut recv).await.context("read PING")?;
+    if ping.frame_type != FrameType::Ping {
+        bail!("{peer}: expected Ping, got {:?}", ping.frame_type);
     }
-    send.write_all(b"pong").await.context("write pong")?;
-    send.finish().context("finish send")?;
-    println!("ping/pong with {peer} OK");
 
-    // Wait for client to close before we drop the connection.
+    let pong = Frame::new(FrameType::Pong, Bytes::new())?;
+    write_frame(&mut send, &pong).await.context("write PONG")?;
+    send.finish().context("finish send")?;
+    println!("framed ping/pong with {peer} OK");
+
+    // Wait for client to close before dropping the connection.
     let _ = conn.closed().await;
     Ok(())
 }

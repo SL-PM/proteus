@@ -1,14 +1,19 @@
 //! PROTEUS client (v0.3 research prototype).
 //!
-//! M3: dial the server over QUIC, open one bidi stream, send `ping`,
-//! expect `pong`, close cleanly. No auth, no SOCKS5 yet — those land
-//! in M6/M9.
+//! M4: dial the server over QUIC, open one bidi stream, send a PROTEUS
+//! PING frame, expect a PONG, close cleanly. No auth, no SOCKS5 yet —
+//! those land in M6/M9.
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use bytes::Bytes;
 use clap::Parser;
-use proteus_core::{config::ClientConfig, tls};
+use proteus_core::{
+    config::ClientConfig,
+    frame::{Frame, FrameType, read_frame, write_frame},
+    tls,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -47,16 +52,15 @@ async fn main() -> Result<()> {
     println!("connected; remote={}", conn.remote_address());
 
     let (mut send, mut recv) = conn.open_bi().await.context("open_bi")?;
-    send.write_all(b"ping").await.context("write ping")?;
+    let ping = Frame::new(FrameType::Ping, Bytes::new())?;
+    write_frame(&mut send, &ping).await.context("write PING")?;
     send.finish().context("finish send")?;
 
-    let mut buf = [0u8; 4];
-    recv.read_exact(&mut buf).await.context("read pong")?;
-    if &buf == b"pong" {
-        println!("ping/pong OK");
-    } else {
-        anyhow::bail!("expected b\"pong\", got {:?}", &buf);
+    let pong = read_frame(&mut recv).await.context("read PONG")?;
+    if pong.frame_type != FrameType::Pong {
+        bail!("expected Pong, got {:?}", pong.frame_type);
     }
+    println!("framed ping/pong OK");
 
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
