@@ -23,25 +23,9 @@ use crate::config::TlsConfig;
 /// ALPN identifier for PROTEUS v0.3 traffic.
 pub const ALPN: &[u8] = b"proteus/0.3";
 
-/// RFC 5705 exporter label for PROTEUS v0.3 auth (spec v0.2 §7.3 / §8.2).
-pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-PROTEUS-v0.3";
-
-/// Length of the PROTEUS v0.3 exporter material in bytes.
-pub const EXPORTER_LEN: usize = 32;
-
 /// Install the default rustls crypto provider. Idempotent.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Extract 32 bytes of RFC 5705 exporter material for PROTEUS auth.
-/// Both sides of a TLS session derive identical bytes when called with
-/// the same label and empty context (verified by the M5 spike).
-pub fn export_proteus(conn: &quinn::Connection) -> Result<[u8; EXPORTER_LEN]> {
-    let mut out = [0u8; EXPORTER_LEN];
-    conn.export_keying_material(&mut out, EXPORTER_LABEL, b"")
-        .map_err(|e| anyhow::anyhow!("export_keying_material: {e:?}"))?;
-    Ok(out)
 }
 
 /// Build a Quinn server config. Returns the chosen leaf cert too, so the
