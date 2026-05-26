@@ -731,9 +731,12 @@ name = "proteus-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
+ "ed25519-dalek",
  "hex",
  "quinn",
+ "rand 0.8.6",
  "rcgen",
  "rustls",
  "serde",
