@@ -55,7 +55,9 @@ pub fn server_config(
     let mut rustls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der.clone()], key_der)?;
-    rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
+    // Server advertises both PROTEUS and HTTP/3. Post-handshake the
+    // bin dispatches on the negotiated ALPN (M13 decoy).
+    rustls_cfg.alpn_protocols = vec![ALPN.to_vec(), b"h3".to_vec()];
 
     let mut qcfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)?,

@@ -47,6 +47,9 @@ const AUTH_FAIL_CLOSE_CODE: u32 = 0x0101;
 /// control stream is accepted. Slow-loris hardening (M18).
 const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// ALPN we advertise alongside `proteus/0.3` for the M13 decoy.
+const H3_ALPN: &[u8] = b"h3";
+
 /// Per spec v0.2 §8.3.
 const REPLAY_TTL: Duration = Duration::from_secs(300);
 
@@ -165,6 +168,17 @@ async fn handle_conn(
 ) -> Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = conn.remote_address();
+
+    // M13: if the client negotiated `h3` instead of `proteus/0.3`,
+    // hand the connection to the embedded H3 decoy and exit before
+    // touching the auth path.
+    if negotiated_alpn(&conn).as_deref() == Some(H3_ALPN) {
+        println!("accepted {peer}: h3 decoy");
+        if let Err(e) = serve_h3_decoy(conn).await {
+            eprintln!("h3 decoy {peer}: {e:#}");
+        }
+        return Ok(());
+    }
     println!("accepted {peer}");
 
     // ----- auth on the control stream -----
@@ -418,4 +432,61 @@ async fn proxy_to_udp(
 
     metrics.proxy_udp_opened_inc();
     proxy::bridge_quic_udp(q_send, q_recv, udp).await
+}
+
+// ---------------- M13 H3 decoy ----------------
+
+/// Pull the negotiated ALPN out of the Quinn handshake data. Used by
+/// M13 to dispatch to the H3 decoy when the client offered `h3`.
+fn negotiated_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|hd| hd.protocol)
+}
+
+/// Static HTML body the H3 decoy returns to any request. Intentionally
+/// generic — no PROTEUS branding leaks. v0.4 REALITY-style upstream
+/// forwarding will replace this with bytes from a real cover host.
+const DECOY_HTML: &[u8] = b"<!DOCTYPE html>\n\
+<html lang=\"en\">\n\
+<head><meta charset=\"utf-8\"><title>Welcome</title></head>\n\
+<body><h1>It works.</h1></body>\n\
+</html>\n";
+
+/// M13 decoy — serve a static 200 OK to any H3 request on this QUIC
+/// connection. Shares the server cert with the PROTEUS path so a
+/// casual prober sees a coherent host. Spec v0.2 §11.
+async fn serve_h3_decoy(conn: quinn::Connection) -> Result<()> {
+    let h3_q = h3_quinn::Connection::new(conn);
+    let mut h3_conn: h3::server::Connection<_, bytes::Bytes> =
+        h3::server::Connection::new(h3_q).await?;
+
+    loop {
+        match h3_conn.accept().await {
+            Ok(Some(resolver)) => {
+                let (_req, mut stream) = match resolver.resolve_request().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("h3 decoy: resolve error: {e:#}");
+                        continue;
+                    }
+                };
+                let resp = http::Response::builder()
+                    .status(200)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(())?;
+                stream.send_response(resp).await?;
+                stream
+                    .send_data(bytes::Bytes::from_static(DECOY_HTML))
+                    .await?;
+                stream.finish().await?;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("h3 decoy: accept error: {e:#}");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
