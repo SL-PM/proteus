@@ -23,6 +23,19 @@ pub const HEADER_LEN: usize = 16;
 /// Maximum payload size accepted in v0.3.
 pub const MAX_PAYLOAD_LEN: usize = 65_535;
 
+/// Frame-flag bit set on padded frames (v0.5 M1.5). When this bit is
+/// present in `flags`, the last 2 bytes of `payload` are
+/// `padding_len: u16` (big-endian) — the number of padding bytes
+/// (zeros) that immediately precede the trailer. Real payload is
+/// `payload[.. payload_len - 2 - padding_len]`. Padding is opaque
+/// to layers above [`crate::frame`]: the wire reader strips it
+/// before the frame reaches application code.
+///
+/// See [`crate::padding`] for the bucket-rounding helpers that
+/// choose `padding_len` for a given bucket size, and for the
+/// `pad_frame` / `depad_frame_payload` round-trip helpers.
+pub const FLAG_PADDED: u16 = 0x0001;
+
 /// Frame type discriminants per spec v0.2 §7.2.
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

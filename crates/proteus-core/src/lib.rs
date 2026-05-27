@@ -8,6 +8,7 @@ pub mod config;
 pub mod decoy;
 pub mod frame;
 pub mod metrics;
+pub mod padding;
 pub mod policy;
 pub mod proxy;
 pub mod ratelimit;
