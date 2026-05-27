@@ -5,7 +5,6 @@ Everything v0.3 cannot finish automatically. Split into:
 - **B.** Before any deployment — must do before v0.3 touches a real
   machine, even a lab one.
 - **C.** Optional polish — session-end housekeeping.
-- **D.** Carry-over from the VPN infra — not PROTEUS, related context.
 
 ---
 
@@ -153,28 +152,6 @@ git remote add origin git@github.com:<user>/proteus.git
 git push -u origin main
 git push origin --tags        # if you tagged in C1
 ```
-
----
-
-## D. Carry-over from the VPN infra
-
-These came from `~/Documents/TradingBot-optimized/docs/vpn-infrastructure.md`
-"Offene Punkte" and were flagged as *operational priority* at the
-start of the PROTEUS work — explicitly deferred so we could focus on
-the prototype. They live on the real VPN infrastructure, not on the
-PROTEUS prototype, and should be tracked there.
-
-- **Panel `:8000` öffentlich erreichbar.** UFW-restrict or
-  SSH-tunnel-only.
-- **REALITY Keys aus alter Conversation exponiert.** Rotation
-  überfällig (every long-lived REALITY config that ever appeared in
-  conversation text should be regenerated).
-- **Nginx TLS-Fallback fehlt.** Direkte IP-Aufrufe sollten eine
-  generische Tarn-Antwort liefern statt verraten, dass dort ein
-  Marzneshin / PROTEUS-Server hört.
-
-These three items predate this repo and are independent of v0.3
-shipping or not.
 
 ---
 
