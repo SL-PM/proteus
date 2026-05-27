@@ -37,7 +37,10 @@ use proteus_core::{
     },
     config::ServerConfig,
     decoy::{DecoyHeaders, is_rewritten_or_dropped},
-    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
+    frame::{
+        Frame, FrameType, read_frame, read_frame_aead, write_frame_aead_maybe_padded,
+        write_frame_maybe_padded,
+    },
     metrics::Metrics,
     policy::PolicyChecker,
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
@@ -92,6 +95,10 @@ struct ServerState {
     /// host. When `None`, the H3 decoy falls back to a hardcoded
     /// minimal nginx-style header set (M3.4 original behavior).
     decoy_headers: Option<Arc<DecoyHeaders>>,
+    /// v0.5 M2.5: when `Some`, every outgoing PROTEUS frame is
+    /// bucket-padded to one of these wire `payload_len` sizes.
+    /// `None` = v0.4-compatible no-padding behavior.
+    padding_buckets: Option<Arc<Vec<usize>>>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -152,6 +159,13 @@ impl Server {
             .map(|p| DecoyHeaders::from_json_file(p).map(Arc::new))
             .transpose()?;
 
+        // v0.5 M2.5: bucket-padding for outgoing frames.
+        let padding_buckets: Option<Arc<Vec<usize>>> = if cfg.padding.enabled {
+            Some(Arc::new(cfg.padding.effective_buckets().to_vec()))
+        } else {
+            None
+        };
+
         Ok(Self {
             endpoint,
             local_addr,
@@ -164,6 +178,7 @@ impl Server {
                 rate_limiter,
                 decoy_html,
                 decoy_headers,
+                padding_buckets,
             },
         })
     }
@@ -221,6 +236,16 @@ impl Server {
     /// hardcoded set.
     pub fn decoy_headers_count(&self) -> Option<usize> {
         self.state.decoy_headers.as_ref().map(|h| h.headers.len())
+    }
+
+    /// True if v0.5 bucket-padding is active for outgoing frames.
+    pub fn padding_enabled(&self) -> bool {
+        self.state.padding_buckets.is_some()
+    }
+
+    /// Effective bucket set in use, or `None` when padding is off.
+    pub fn padding_buckets(&self) -> Option<&[usize]> {
+        self.state.padding_buckets.as_deref().map(|v| v.as_slice())
     }
 
     /// Reference to the underlying Quinn endpoint. Tests can use this
@@ -370,12 +395,14 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
 
+    let pad_buckets = state.padding_buckets.as_deref().map(|v| v.as_slice());
+
     let client_id = match state.registry.verify(&req, &exporter) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{peer}: auth FAIL ({}): {e:#}", req.client_id);
             state.metrics.auth_failed_inc();
-            reject_auth(&mut ctrl_send, &conn).await;
+            reject_auth(&mut ctrl_send, &conn, pad_buckets).await;
             return Ok(());
         }
     };
@@ -383,12 +410,12 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
     if let Err(e) = state.replay.check_and_record(&client_id, &req.nonce) {
         eprintln!("{peer}: REPLAY rejected for {client_id}: {e:#}");
         state.metrics.replay_rejected_inc();
-        reject_auth(&mut ctrl_send, &conn).await;
+        reject_auth(&mut ctrl_send, &conn, pad_buckets).await;
         return Ok(());
     }
 
     let resp_frame = Frame::new(FrameType::AuthResponse, AuthResponse::ok().encode()?)?;
-    write_frame(&mut ctrl_send, &resp_frame)
+    write_frame_maybe_padded(&mut ctrl_send, &resp_frame, pad_buckets)
         .await
         .context("write AUTH_RESPONSE")?;
     state.metrics.auth_success_inc();
@@ -410,8 +437,17 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
         let policy = state.policy.clone();
         let metrics = state.metrics.clone();
         let session_key = session_key.clone();
+        let padding_buckets = state.padding_buckets.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy, metrics, session_key).await
+            if let Err(e) = handle_proxy_stream(
+                q_send,
+                q_recv,
+                policy,
+                metrics,
+                session_key,
+                padding_buckets,
+            )
+            .await
             {
                 eprintln!("proxy {label}: {e:#}");
             }
@@ -422,11 +458,15 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
     Ok(())
 }
 
-async fn reject_auth(ctrl_send: &mut quinn::SendStream, conn: &quinn::Connection) {
+async fn reject_auth(
+    ctrl_send: &mut quinn::SendStream,
+    conn: &quinn::Connection,
+    pad_buckets: Option<&[usize]>,
+) {
     if let Ok(bytes) = AuthResponse::err(STATUS_AUTH_FAILED).encode()
         && let Ok(frame) = Frame::new(FrameType::AuthResponse, bytes)
     {
-        let _ = write_frame(ctrl_send, &frame).await;
+        let _ = write_frame_maybe_padded(ctrl_send, &frame, pad_buckets).await;
     }
     conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
 }
@@ -437,12 +477,14 @@ async fn handle_proxy_stream(
     policy: Option<Arc<PolicyChecker>>,
     metrics: Arc<Metrics>,
     session_key: Arc<[u8; aead::KEY_LEN]>,
+    padding_buckets: Option<Arc<Vec<usize>>>,
 ) -> Result<()> {
     // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
     // post-auth. Derive this stream's key + (send, recv) pair from the
     // session key plus the QUIC stream id.
     let stream_id = q_send.id().index();
     let mut sa = ProxyStreamAead::for_server(&session_key, stream_id);
+    let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
 
     let open_frame = read_frame_aead(&mut q_recv, &mut sa.recv)
         .await
@@ -453,6 +495,7 @@ async fn handle_proxy_stream(
             reject_codes::PROTOCOL_ERROR,
             &mut sa.send,
             stream_id,
+            pad_buckets,
         )
         .await;
         bail!("expected PROXY_OPEN, got {:?}", open_frame.frame_type);
@@ -465,6 +508,7 @@ async fn handle_proxy_stream(
                 reject_codes::PROTOCOL_ERROR,
                 &mut sa.send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("malformed PROXY_OPEN: {e:#}");
@@ -483,6 +527,7 @@ async fn handle_proxy_stream(
                 sa.send,
                 sa.recv,
                 stream_id,
+                padding_buckets,
             )
             .await
         }
@@ -497,6 +542,7 @@ async fn handle_proxy_stream(
                 sa.send,
                 sa.recv,
                 stream_id,
+                padding_buckets,
             )
             .await
         }
@@ -506,6 +552,7 @@ async fn handle_proxy_stream(
                 reject_codes::UNSUPPORTED_CMD,
                 &mut sa.send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("unsupported cmd {other:?}");
@@ -518,6 +565,7 @@ async fn reject_proxy(
     reason: u8,
     aead_send: &mut aead::InnerAead,
     stream_id: u64,
+    pad_buckets: Option<&[usize]>,
 ) -> Result<()> {
     let frame = Frame {
         frame_type: FrameType::ProxyReject,
@@ -525,7 +573,7 @@ async fn reject_proxy(
         stream_id,
         payload: ProxyReject::new(reason).encode(),
     };
-    write_frame_aead(q_send, &frame, aead_send)
+    write_frame_aead_maybe_padded(q_send, &frame, aead_send, pad_buckets)
         .await
         .context("write PROXY_REJECT")?;
     Ok(())
@@ -553,7 +601,9 @@ async fn proxy_to_tcp(
     mut aead_send: aead::InnerAead,
     aead_recv: aead::InnerAead,
     stream_id: u64,
+    padding_buckets: Option<Arc<Vec<usize>>>,
 ) -> Result<()> {
+    let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
@@ -563,6 +613,7 @@ async fn proxy_to_tcp(
                 reject_codes::UPSTREAM_UNREACHABLE,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             return Err(e);
@@ -578,6 +629,7 @@ async fn proxy_to_tcp(
                 reject_codes::POLICY_DENIED,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("policy denied tcp {host}:{port}: {e}");
@@ -593,6 +645,7 @@ async fn proxy_to_tcp(
                 reject_codes::UPSTREAM_UNREACHABLE,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("tcp connect {host}:{port} ({}): {e}", resolved[0]);
@@ -606,13 +659,23 @@ async fn proxy_to_tcp(
         stream_id,
         payload: Bytes::new(),
     };
-    write_frame_aead(&mut q_send, &accept, &mut aead_send)
+    write_frame_aead_maybe_padded(&mut q_send, &accept, &mut aead_send, pad_buckets)
         .await
         .context("write PROXY_ACCEPT")?;
 
     metrics.proxy_tcp_opened_inc();
     let (tcp_r, tcp_w) = tcp.into_split();
-    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w, aead_send, aead_recv).await
+    let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    proxy::bridge_quic_tcp(
+        q_send,
+        q_recv,
+        tcp_r,
+        tcp_w,
+        aead_send,
+        aead_recv,
+        bridge_buckets,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -626,7 +689,9 @@ async fn proxy_to_udp(
     mut aead_send: aead::InnerAead,
     aead_recv: aead::InnerAead,
     stream_id: u64,
+    padding_buckets: Option<Arc<Vec<usize>>>,
 ) -> Result<()> {
+    let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
@@ -636,6 +701,7 @@ async fn proxy_to_udp(
                 reject_codes::UPSTREAM_UNREACHABLE,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             return Err(e);
@@ -651,6 +717,7 @@ async fn proxy_to_udp(
                 reject_codes::POLICY_DENIED,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("policy denied udp {host}:{port}: {e}");
@@ -666,6 +733,7 @@ async fn proxy_to_udp(
                 reject_codes::UPSTREAM_UNREACHABLE,
                 &mut aead_send,
                 stream_id,
+                pad_buckets,
             )
             .await;
             bail!("udp bind: {e}");
@@ -678,6 +746,7 @@ async fn proxy_to_udp(
             reject_codes::UPSTREAM_UNREACHABLE,
             &mut aead_send,
             stream_id,
+            pad_buckets,
         )
         .await;
         bail!("udp connect {host}:{port} ({}): {e}", resolved[0]);
@@ -690,12 +759,13 @@ async fn proxy_to_udp(
         stream_id,
         payload: Bytes::new(),
     };
-    write_frame_aead(&mut q_send, &accept, &mut aead_send)
+    write_frame_aead_maybe_padded(&mut q_send, &accept, &mut aead_send, pad_buckets)
         .await
         .context("write PROXY_ACCEPT")?;
 
     metrics.proxy_udp_opened_inc();
-    proxy::bridge_quic_udp(q_send, q_recv, udp, aead_send, aead_recv).await
+    let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    proxy::bridge_quic_udp(q_send, q_recv, udp, aead_send, aead_recv, bridge_buckets).await
 }
 
 // ---------------- M13 H3 decoy ----------------

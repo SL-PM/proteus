@@ -110,8 +110,26 @@ impl ProxyReject {
     }
 }
 
-/// Buffer size for one TCP → QUIC chunk; each chunk becomes one DATA frame.
+/// Buffer size for one TCP → QUIC chunk when padding is disabled.
+/// Each chunk becomes one DATA frame.
 pub const BRIDGE_BUF_SIZE: usize = 8192;
+
+/// Pick the TCP-read buffer size when bucket-padding is in effect.
+/// Returns `max(buckets) - aead_tag - pad_trailer` so the post-AEAD
+/// wire `payload_len` lands exactly on the largest bucket. Falls
+/// back to [`BRIDGE_BUF_SIZE`] when `buckets` is `None`.
+pub fn bridge_buf_size(buckets: Option<&[usize]>) -> usize {
+    use crate::{aead::TAG_LEN, padding::PAD_TRAILER_LEN};
+    match buckets {
+        None => BRIDGE_BUF_SIZE,
+        Some(b) => b
+            .iter()
+            .copied()
+            .max()
+            .map(|m| m.saturating_sub(TAG_LEN + PAD_TRAILER_LEN))
+            .unwrap_or(BRIDGE_BUF_SIZE),
+    }
+}
 
 /// Bidirectional bridge between a Quinn (send, recv) pair carrying PROTEUS
 /// DATA frames and an arbitrary AsyncRead/AsyncWrite split (typically a TCP
@@ -122,6 +140,12 @@ pub const BRIDGE_BUF_SIZE: usize = 8192;
 /// Returns when either direction reaches EOF (or errors). The QUIC-side
 /// EOF is signaled by `read_frame` returning Err or by any non-DATA frame;
 /// the TCP-side EOF is the usual zero-length read.
+///
+/// v0.5 M2.5: `wire_buckets` enables bucket-padding for outgoing DATA
+/// frames. `None` = no padding (v0.4 behavior); `Some(buckets)` =
+/// every emitted frame's wire `payload_len` is rounded up to a
+/// bucket. The TCP-read buffer also shrinks to fit the largest bucket
+/// so a single TCP chunk never overflows.
 pub async fn bridge_quic_tcp<R, W>(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
@@ -129,15 +153,17 @@ pub async fn bridge_quic_tcp<R, W>(
     mut tcp_w: W,
     mut aead_send: crate::aead::InnerAead,
     mut aead_recv: crate::aead::InnerAead,
+    wire_buckets: Option<Vec<usize>>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWrite + Unpin + Send,
 {
-    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead};
+    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead_maybe_padded};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let stream_id = q_send.id().index();
+    let buf_size = bridge_buf_size(wire_buckets.as_deref());
 
     let q2t = async move {
         loop {
@@ -157,7 +183,7 @@ where
     };
 
     let t2q = async move {
-        let mut buf = vec![0u8; BRIDGE_BUF_SIZE];
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = tcp_r.read(&mut buf).await?;
             if n == 0 {
@@ -169,7 +195,13 @@ where
                 stream_id,
                 payload: Bytes::copy_from_slice(&buf[..n]),
             };
-            write_frame_aead(&mut q_send, &frame, &mut aead_send).await?;
+            write_frame_aead_maybe_padded(
+                &mut q_send,
+                &frame,
+                &mut aead_send,
+                wire_buckets.as_deref(),
+            )
+            .await?;
         }
         let _ = q_send.finish();
         Ok::<(), anyhow::Error>(())
@@ -197,16 +229,18 @@ pub async fn bridge_quic_udp(
     udp: tokio::net::UdpSocket,
     mut aead_send: crate::aead::InnerAead,
     mut aead_recv: crate::aead::InnerAead,
+    wire_buckets: Option<Vec<usize>>,
 ) -> anyhow::Result<()> {
     use std::{sync::Arc, time::Duration};
 
-    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead};
+    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead_maybe_padded};
 
     /// Max IPv4 UDP datagram payload (65535 - 8 UDP - 20 IP).
     const UDP_RECV_BUF: usize = 65_507;
     const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
     let stream_id = q_send.id().index();
+    let u2q_buf_size = bridge_buf_size(wire_buckets.as_deref());
 
     let udp = Arc::new(udp);
     let udp_send = udp.clone();
@@ -229,7 +263,15 @@ pub async fn bridge_quic_udp(
     };
 
     let u2q = async move {
-        let mut buf = vec![0u8; UDP_RECV_BUF];
+        // With padding ON the read buffer is sized to fit a single
+        // bucketed frame; without padding we keep the full UDP MTU.
+        // Datagrams larger than `u2q_buf_size` get truncated by the
+        // OS — operators running padded UDP must accept this trade.
+        let buf_size = match wire_buckets.as_deref() {
+            Some(_) => u2q_buf_size,
+            None => UDP_RECV_BUF,
+        };
+        let mut buf = vec![0u8; buf_size];
         loop {
             let n = udp_recv.recv(&mut buf).await?;
             let frame = Frame {
@@ -238,7 +280,13 @@ pub async fn bridge_quic_udp(
                 stream_id,
                 payload: Bytes::copy_from_slice(&buf[..n]),
             };
-            write_frame_aead(&mut q_send, &frame, &mut aead_send).await?;
+            write_frame_aead_maybe_padded(
+                &mut q_send,
+                &frame,
+                &mut aead_send,
+                wire_buckets.as_deref(),
+            )
+            .await?;
         }
         // The loop above is divergent; this Ok exists so the async
         // block's return type can be inferred as Result<(), _>.

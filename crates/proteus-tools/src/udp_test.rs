@@ -16,7 +16,10 @@ use proteus_core::{
     aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
     config::ClientConfig,
-    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
+    frame::{
+        Frame, FrameType, read_frame, read_frame_aead, write_frame_aead_maybe_padded,
+        write_frame_maybe_padded,
+    },
     proxy::{ProxyOpen, ProxyReject},
     tls,
 };
@@ -56,15 +59,23 @@ pub async fn run(args: Args) -> Result<()> {
         .context("handshake")?;
     println!("connected; remote={}", conn.remote_address());
 
+    let pad_buckets_owned: Option<Vec<usize>> = if cfg.padding.enabled {
+        Some(cfg.padding.effective_buckets().to_vec())
+    } else {
+        None
+    };
+    let pad_buckets = pad_buckets_owned.as_deref();
+
     // ----- auth -----
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open ctrl bi")?;
     let mut exporter = [0u8; EXPORTER_LEN];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
     let req = AuthRequest::sign(&cfg.identity.client_id, &sk, &exporter)?;
-    write_frame(
+    write_frame_maybe_padded(
         &mut ctrl_send,
         &Frame::new(FrameType::AuthRequest, req.encode()?)?,
+        pad_buckets,
     )
     .await
     .context("write AUTH_REQUEST")?;
@@ -97,7 +108,7 @@ pub async fn run(args: Args) -> Result<()> {
         stream_id,
         payload: open.encode()?,
     };
-    write_frame_aead(&mut q_send, &open_frame, &mut sa.send)
+    write_frame_aead_maybe_padded(&mut q_send, &open_frame, &mut sa.send, pad_buckets)
         .await
         .context("write PROXY_OPEN")?;
 
@@ -121,7 +132,7 @@ pub async fn run(args: Args) -> Result<()> {
         stream_id,
         payload: payload.clone(),
     };
-    write_frame_aead(&mut q_send, &data_frame, &mut sa.send)
+    write_frame_aead_maybe_padded(&mut q_send, &data_frame, &mut sa.send, pad_buckets)
         .await
         .context("write DATA")?;
     q_send.finish().context("finish send")?;

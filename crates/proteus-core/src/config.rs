@@ -30,6 +30,9 @@ pub struct ServerConfig {
     /// M13: local H3 decoy.
     #[serde(default)]
     pub decoy: Option<DecoyConfig>,
+    /// v0.5 M1.5+: bucket padding for outgoing frames.
+    #[serde(default)]
+    pub padding: PaddingConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -68,6 +71,39 @@ pub struct DecoyConfig {
     pub static_headers: Option<PathBuf>,
 }
 
+/// v0.5 M1.5+: bucket padding for wire-fingerprint reduction.
+///
+/// Both server and client carry the same shape, and both ends MUST be
+/// configured identically in v0.5-rc.1 — there's no protocol-level
+/// negotiation. Mismatched padding settings produce decode errors on
+/// the receiving side.
+///
+/// Read paths auto-depad regardless of this config (the `FLAG_PADDED`
+/// bit on the wire is self-describing). Write paths consult this
+/// config to decide whether to pad outgoing frames.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PaddingConfig {
+    /// Master switch. `false` (default) = behave exactly like v0.4.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bucket sizes in bytes. Defaults to
+    /// [`crate::padding::DEFAULT_BUCKETS`] when omitted or empty.
+    #[serde(default)]
+    pub buckets: Vec<usize>,
+}
+
+impl PaddingConfig {
+    /// Effective bucket set: caller's explicit override if non-empty,
+    /// otherwise the workspace default.
+    pub fn effective_buckets(&self) -> &[usize] {
+        if self.buckets.is_empty() {
+            crate::padding::DEFAULT_BUCKETS
+        } else {
+            &self.buckets
+        }
+    }
+}
+
 impl ServerConfig {
     pub fn from_yaml_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -84,6 +120,9 @@ pub struct ClientConfig {
     pub server: ServerEndpoint,
     pub identity: ClientIdentity,
     pub socks5: Socks5Config,
+    /// v0.5 M1.5+: bucket padding for outgoing frames.
+    #[serde(default)]
+    pub padding: PaddingConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }

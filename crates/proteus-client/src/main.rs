@@ -23,7 +23,10 @@ use proteus_core::{
     aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
     config::ClientConfig,
-    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
+    frame::{
+        Frame, FrameType, read_frame, read_frame_aead, write_frame_aead_maybe_padded,
+        write_frame_maybe_padded,
+    },
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
     tls,
 };
@@ -87,10 +90,17 @@ async fn main() -> Result<()> {
     let mut exporter = [0u8; EXPORTER_LEN];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
+    let pad_buckets: Option<Arc<Vec<usize>>> = if cfg.padding.enabled {
+        Some(Arc::new(cfg.padding.effective_buckets().to_vec()))
+    } else {
+        None
+    };
+
     let req = AuthRequest::sign(&cfg.identity.client_id, &sk, &exporter)?;
-    write_frame(
+    write_frame_maybe_padded(
         &mut ctrl_send,
         &Frame::new(FrameType::AuthRequest, req.encode()?)?,
+        pad_buckets.as_deref().map(|v| v.as_slice()),
     )
     .await
     .context("write AUTH_REQUEST")?;
@@ -126,8 +136,9 @@ async fn main() -> Result<()> {
         let (sock, peer) = listener.accept().await.context("accept SOCKS5")?;
         let conn = conn.clone();
         let session_key = session_key.clone();
+        let pad_buckets = pad_buckets.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, conn, session_key).await {
+            if let Err(e) = handle_socks5(sock, conn, session_key, pad_buckets).await {
                 eprintln!("socks5 {peer}: {e:#}");
             }
         });
@@ -138,7 +149,9 @@ async fn handle_socks5(
     mut sock: TcpStream,
     qconn: Arc<quinn::Connection>,
     session_key: Arc<[u8; aead::KEY_LEN]>,
+    padding_buckets: Option<Arc<Vec<usize>>>,
 ) -> Result<()> {
+    let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     // ----- Greeting: [ver, nmethods, methods...] -----
     let mut hdr = [0u8; 2];
     sock.read_exact(&mut hdr).await.context("read greeting")?;
@@ -212,7 +225,7 @@ async fn handle_socks5(
         stream_id,
         payload: open.encode()?,
     };
-    write_frame_aead(&mut q_send, &open_frame, &mut sa.send)
+    write_frame_aead_maybe_padded(&mut q_send, &open_frame, &mut sa.send, pad_buckets)
         .await
         .context("write PROXY_OPEN")?;
 
@@ -243,7 +256,17 @@ async fn handle_socks5(
 
     // ----- Bridge SOCKS5 socket ↔ QUIC proxy stream -----
     let (tcp_r, tcp_w) = sock.into_split();
-    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w, sa.send, sa.recv).await
+    let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    proxy::bridge_quic_tcp(
+        q_send,
+        q_recv,
+        tcp_r,
+        tcp_w,
+        sa.send,
+        sa.recv,
+        bridge_buckets,
+    )
+    .await
 }
 
 async fn send_socks5_reply(sock: &mut TcpStream, rep: u8) -> Result<()> {

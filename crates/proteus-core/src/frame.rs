@@ -167,24 +167,46 @@ pub async fn write_frame_aead<W: AsyncWrite + Unpin>(
 
 /// Read a frame whose payload was AEAD-sealed by the peer (M5.4.1).
 /// Returns the frame with the plaintext payload. Counter advances by 1.
+///
+/// v0.5 M1.5+: if [`FLAG_PADDED`] is set on the incoming wire frame,
+/// the padding lives INSIDE the AEAD-sealed block. We open the
+/// ciphertext first (AAD covers the WIRE flags, including the PADDED
+/// bit), then strip the padding before returning. The flag is cleared
+/// on the returned frame so callers see a v0.4-shape result.
 pub async fn read_frame_aead<R: AsyncRead + Unpin>(
     reader: &mut R,
     aead: &mut crate::aead::InnerAead,
 ) -> Result<Frame> {
-    let raw = read_frame(reader).await?;
+    let raw = read_raw_frame(reader).await?;
     let aad = aad_for_frame_header(raw.frame_type, raw.flags, raw.stream_id);
     let plaintext = aead.open(&raw.payload, &aad)?;
-    Ok(Frame {
+    let mut decoded = Frame {
         frame_type: raw.frame_type,
         flags: raw.flags,
         stream_id: raw.stream_id,
         payload: plaintext,
-    })
+    };
+    crate::padding::take_depadded_payload(&mut decoded)?;
+    Ok(decoded)
 }
 
 /// Read one frame from any `AsyncRead`. Reads exactly the header, then
 /// exactly the announced payload length.
+///
+/// v0.5 M1.5+: if [`FLAG_PADDED`] is set on the wire, the trailing
+/// padding bytes are stripped before returning and the flag is cleared.
+/// Callers see a v0.4-shape frame regardless of wire-side padding.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
+    let mut decoded = read_raw_frame(reader).await?;
+    crate::padding::take_depadded_payload(&mut decoded)?;
+    Ok(decoded)
+}
+
+/// Internal: read a frame off the wire WITHOUT touching any padding.
+/// Used by both `read_frame` and `read_frame_aead`; the latter must
+/// see the still-padded payload as AEAD ciphertext input before
+/// depadding can happen.
+async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
     let mut header = [0u8; HEADER_LEN];
     reader.read_exact(&mut header).await?;
     let mut h = &header[..];
@@ -213,6 +235,65 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &Frame) -
     let bytes = frame.encode()?;
     writer.write_all(&bytes).await?;
     Ok(())
+}
+
+/// v0.5 M2.5: write a frame, optionally bucket-padding it first.
+///
+/// `wire_buckets` describes the desired *on-wire* `payload_len` bucket
+/// set. When `None`, behaves exactly like [`write_frame`] (v0.4
+/// compatibility). When `Some`, the frame's `payload` is padded to
+/// the smallest fitting wire bucket and [`FLAG_PADDED`] is set
+/// before the encode.
+///
+/// Errors if no bucket fits the real payload — caller must split
+/// (the proxy bridges do this naturally by reading less per turn
+/// when padding is enabled).
+pub async fn write_frame_maybe_padded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Frame,
+    wire_buckets: Option<&[usize]>,
+) -> Result<()> {
+    match wire_buckets {
+        None => write_frame(writer, frame).await,
+        Some(buckets) => {
+            // Plain (non-AEAD) frame: wire payload == post-pad payload,
+            // so wire bucket == padded bucket directly.
+            let padded = crate::padding::pad_frame(frame.clone(), buckets)?;
+            write_frame(writer, &padded).await
+        }
+    }
+}
+
+/// v0.5 M2.5: AEAD-seal and write a frame, optionally bucket-padding
+/// the plaintext first so the WIRE `payload_len` lands on a bucket.
+///
+/// Because AEAD adds [`crate::aead::TAG_LEN`] (16) bytes of tag, the
+/// pre-AEAD plaintext is padded to (`bucket` − 16) bytes for each
+/// caller-supplied wire bucket. The padded plaintext is then sealed,
+/// and the resulting wire `payload_len` equals the chosen bucket
+/// exactly.
+///
+/// `wire_buckets` controls the on-wire payload-size distribution. Use
+/// e.g. `Some(&[128, 256, 512, 1024, 1500])` for the v0.5 default.
+/// `None` = no padding, behaves exactly like [`write_frame_aead`].
+pub async fn write_frame_aead_maybe_padded<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Frame,
+    aead: &mut crate::aead::InnerAead,
+    wire_buckets: Option<&[usize]>,
+) -> Result<()> {
+    match wire_buckets {
+        None => write_frame_aead(writer, frame, aead).await,
+        Some(buckets) => {
+            // AEAD adds TAG_LEN bytes between pad-output and wire.
+            // Pad the plaintext to (wire_bucket - TAG_LEN); after seal
+            // the wire payload_len equals wire_bucket.
+            let tag = crate::aead::TAG_LEN;
+            let inner_buckets: Vec<usize> = buckets.iter().map(|b| b.saturating_sub(tag)).collect();
+            let padded = crate::padding::pad_frame(frame.clone(), &inner_buckets)?;
+            write_frame_aead(writer, &padded, aead).await
+        }
+    }
 }
 
 // ----------- tests -----------
@@ -371,6 +452,154 @@ mod tests {
         assert_eq!(&aad[0..2], &(FrameType::Data as u16).to_be_bytes());
         assert_eq!(&aad[2..4], &0xABCD_u16.to_be_bytes());
         assert_eq!(&aad[4..12], &0x0123_4567_89AB_CDEF_u64.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn padded_plain_frame_wire_payload_lands_on_bucket() {
+        // 50-byte real → smallest bucket fitting (50 + 2 trailer) = 128.
+        // Wire payload_len = 128 exactly.
+        let f = Frame::new(FrameType::Data, vec![0xAA; 50]).unwrap();
+        let buckets = crate::padding::DEFAULT_BUCKETS;
+
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let (w, r) = tokio::join!(
+            write_frame_maybe_padded(&mut a, &f, Some(buckets)),
+            // Peek at the raw wire bytes via read_raw_frame (skip auto-depad)
+            // to assert on the wire-level payload_len. We do this by reading
+            // the header manually.
+            async {
+                let mut header = [0u8; HEADER_LEN];
+                tokio::io::AsyncReadExt::read_exact(&mut b, &mut header)
+                    .await
+                    .unwrap();
+                let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap());
+                let flags = u16::from_be_bytes(header[2..4].try_into().unwrap());
+                let mut body = vec![0u8; payload_len as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut b, &mut body)
+                    .await
+                    .unwrap();
+                (payload_len, flags, body)
+            }
+        );
+        w.unwrap();
+        let (payload_len, flags, _body) = r;
+        assert_eq!(payload_len, 128, "wire payload must equal bucket size");
+        assert!(
+            flags & FLAG_PADDED != 0,
+            "PADDED flag must be set on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn padded_plain_frame_round_trips_and_auto_depads() {
+        // write_frame_maybe_padded pads + writes; read_frame auto-depads.
+        // Application code sees the original real payload.
+        let f = Frame::new(FrameType::Data, &b"hello"[..]).unwrap();
+        let buckets = crate::padding::DEFAULT_BUCKETS;
+
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let (w, r) = tokio::join!(
+            write_frame_maybe_padded(&mut a, &f, Some(buckets)),
+            read_frame(&mut b)
+        );
+        w.unwrap();
+        let got = r.unwrap();
+        assert_eq!(got.payload.as_ref(), b"hello");
+        assert_eq!(got.flags, 0, "depad must clear the PADDED flag");
+    }
+
+    #[tokio::test]
+    async fn padded_aead_frame_wire_lands_on_bucket_after_tag() {
+        // With AEAD adding 16-byte tag, plaintext is padded to (bucket - 16)
+        // so wire `payload_len` lands exactly on `bucket`.
+        use crate::aead::{DIR_C2S, InnerAead};
+        let session = InnerAead::derive_key(
+            b"exp-32bytes-of-test-material-aa",
+            b"nonce-32-bytes-of-test-input-bb",
+        )
+        .unwrap();
+        let stream_key = InnerAead::derive_stream_key(&session, 7);
+        let mut send = InnerAead::for_direction(&stream_key, DIR_C2S);
+
+        let buckets = crate::padding::DEFAULT_BUCKETS;
+        let mut f = Frame::new(FrameType::Data, &b"hello-aead-padded"[..]).unwrap();
+        f.stream_id = 7;
+
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let (w, r) = tokio::join!(
+            write_frame_aead_maybe_padded(&mut a, &f, &mut send, Some(buckets)),
+            async {
+                let mut header = [0u8; HEADER_LEN];
+                tokio::io::AsyncReadExt::read_exact(&mut b, &mut header)
+                    .await
+                    .unwrap();
+                let payload_len = u32::from_be_bytes(header[12..16].try_into().unwrap());
+                let mut body = vec![0u8; payload_len as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut b, &mut body)
+                    .await
+                    .unwrap();
+                payload_len
+            }
+        );
+        w.unwrap();
+        let payload_len = r;
+        // 17-byte real + 2 trailer = 19 inner; smallest inner-bucket >= 19
+        // from { 112, 240, 496, 1008, 1484 } is 112. So wire = 128.
+        assert_eq!(payload_len, 128, "wire bucket alignment");
+    }
+
+    #[tokio::test]
+    async fn padded_aead_frame_round_trips_with_auto_depad() {
+        use crate::aead::{DIR_C2S, InnerAead};
+        let session = InnerAead::derive_key(
+            b"exp-32bytes-of-test-material-aa",
+            b"nonce-32-bytes-of-test-input-bb",
+        )
+        .unwrap();
+        let stream_key = InnerAead::derive_stream_key(&session, 9);
+        let mut send = InnerAead::for_direction(&stream_key, DIR_C2S);
+        let mut recv = InnerAead::for_direction(&stream_key, DIR_C2S);
+
+        let buckets = crate::padding::DEFAULT_BUCKETS;
+        let mut f = Frame::new(FrameType::Data, &b"roundtrip"[..]).unwrap();
+        f.stream_id = 9;
+
+        let (mut a, mut b) = tokio::io::duplex(2048);
+        let (w, r) = tokio::join!(
+            write_frame_aead_maybe_padded(&mut a, &f, &mut send, Some(buckets)),
+            read_frame_aead(&mut b, &mut recv)
+        );
+        w.unwrap();
+        let got = r.unwrap();
+        assert_eq!(got.payload.as_ref(), b"roundtrip");
+        assert_eq!(got.flags, 0, "PADDED flag must be cleared after depad");
+        assert_eq!(got.stream_id, 9);
+    }
+
+    #[tokio::test]
+    async fn maybe_padded_with_none_matches_plain_write() {
+        // wire_buckets=None must produce byte-identical wire output to
+        // plain write_frame — proves v0.4 compatibility.
+        let f = Frame::new(FrameType::Data, &b"unpadded"[..]).unwrap();
+
+        let (mut a1, mut b1) = tokio::io::duplex(256);
+        let (mut a2, mut b2) = tokio::io::duplex(256);
+        let (w1, w2) = tokio::join!(
+            write_frame_maybe_padded(&mut a1, &f, None),
+            write_frame(&mut a2, &f)
+        );
+        w1.unwrap();
+        w2.unwrap();
+
+        let mut buf1 = vec![0u8; HEADER_LEN + f.payload.len()];
+        let mut buf2 = vec![0u8; HEADER_LEN + f.payload.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut b1, &mut buf1)
+            .await
+            .unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut b2, &mut buf2)
+            .await
+            .unwrap();
+        assert_eq!(buf1, buf2, "None bucket must match plain write");
     }
 
     #[test]
