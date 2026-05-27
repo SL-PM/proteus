@@ -1,19 +1,15 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M7: M6 auth + per-client `(client_id, nonce)` replay cache. The
-//! cache TTL is 300s per spec v0.2 §8.3; a background sweeper drops
-//! expired entries every 60s.
+//! M8: M7 auth + replay cache, plus per-target TCP proxy streams (spec
+//! v0.2 §9). For each connection:
+//!   1. accept control stream, run auth + replay check
+//!   2. on success: AUTH_RESPONSE(ok), then loop `accept_bi()` for
+//!      additional bidi streams. Each is treated as a proxy stream:
+//!      read PROXY_OPEN, attempt `TcpStream::connect`, then either
+//!      PROXY_ACCEPT + bridge DATA ↔ raw TCP, or PROXY_REJECT(reason).
+//!   3. on auth failure: `H3_GENERAL_PROTOCOL_ERROR` close (no plaintext)
 //!
-//! For each connection:
-//!   1. accept control stream (first bidi)
-//!   2. read AUTH_REQUEST, verify Ed25519 signature against the TLS
-//!      exporter, check the replay cache
-//!   3. on success: send AUTH_RESPONSE(status=0), accept a second bidi
-//!      for the M4-style framed PING/PONG demo
-//!   4. on failure (bad sig OR replay): close with
-//!      `H3_GENERAL_PROTOCOL_ERROR` (spec §8.4)
-//!
-//! Real proxying (M8+), policy (M12), and decoy (M13) still missing.
+//! Policy (M12), UDP (M10), and decoy (M13) still missing.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -26,8 +22,13 @@ use proteus_core::{
     },
     config::ServerConfig,
     frame::{Frame, FrameType, read_frame, write_frame},
+    proxy::{ProxyOpen, ProxyReject, reject as reject_codes},
     replay::ReplayCache,
     tls,
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
 };
 
 /// QUIC application close code on auth failure — same family as
@@ -39,6 +40,9 @@ const REPLAY_TTL: Duration = Duration::from_secs(300);
 
 /// How often to sweep expired entries from the replay cache.
 const REPLAY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Buffer size for TCP → QUIC chunks. Each chunk becomes one DATA frame.
+const PROXY_COPY_BUF: usize = 8192;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,7 +80,7 @@ async fn main() -> Result<()> {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
     println!();
-    println!("M7: exporter-bound Ed25519 auth + replay cache + framed PING/PONG. Ctrl-C to stop.");
+    println!("M8: auth + replay cache + TCP proxy. Ctrl-C to stop.");
 
     spawn_replay_sweeper(replay.clone());
 
@@ -95,8 +99,7 @@ async fn main() -> Result<()> {
 fn spawn_replay_sweeper(replay: Arc<ReplayCache>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(REPLAY_SWEEP_INTERVAL);
-        // Skip the immediate fire so we don't log on startup.
-        tick.tick().await;
+        tick.tick().await; // skip the immediate fire
         loop {
             tick.tick().await;
             let dropped = replay.sweep();
@@ -119,7 +122,7 @@ async fn handle_conn(
     let peer = conn.remote_address();
     println!("accepted {peer}");
 
-    // ----- auth on the control stream (first bidi) -----
+    // ----- auth on the control stream -----
     let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await.context("accept_bi ctrl")?;
     let auth_frame = read_frame(&mut ctrl_recv)
         .await
@@ -145,56 +148,142 @@ async fn handle_conn(
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
 
-    // Step 1: signature verification.
     let client_id = match registry.verify(&req, &exporter) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{peer}: auth FAIL ({}): {e:#}", req.client_id);
-            reject(&mut ctrl_send, &conn).await;
+            reject_auth(&mut ctrl_send, &conn).await;
             return Ok(());
         }
     };
 
-    // Step 2: replay check. Same on-wire close as a bad signature so a
-    // passive observer can't distinguish.
     if let Err(e) = replay.check_and_record(&client_id, &req.nonce) {
         eprintln!("{peer}: REPLAY rejected for {client_id}: {e:#}");
-        reject(&mut ctrl_send, &conn).await;
+        reject_auth(&mut ctrl_send, &conn).await;
         return Ok(());
     }
 
-    // Both checks passed — send the success response.
     let resp_frame = Frame::new(FrameType::AuthResponse, AuthResponse::ok().encode()?)?;
     write_frame(&mut ctrl_send, &resp_frame)
         .await
         .context("write AUTH_RESPONSE")?;
     println!("{peer}: auth OK as {client_id}");
 
-    // ----- M4-style framed PING/PONG on a second bidi -----
-    let (mut data_send, mut data_recv) = conn.accept_bi().await.context("accept_bi data")?;
-    let ping = read_frame(&mut data_recv).await.context("read PING")?;
-    if ping.frame_type != FrameType::Ping {
-        bail!("{peer}: expected Ping, got {:?}", ping.frame_type);
+    // ----- per-target proxy streams -----
+    let peer_label = format!("{peer}/{client_id}");
+    while let Ok((q_send, q_recv)) = conn.accept_bi().await {
+        let label = peer_label.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_proxy_stream(q_send, q_recv).await {
+                eprintln!("proxy {label}: {e:#}");
+            }
+        });
     }
-    let pong = Frame::new(FrameType::Pong, Bytes::new())?;
-    write_frame(&mut data_send, &pong)
-        .await
-        .context("write PONG")?;
-    data_send.finish().context("finish data send")?;
-    println!("framed ping/pong with {peer} OK");
-
-    let _ = conn.closed().await;
+    println!("{peer_label}: closed");
     Ok(())
 }
 
-/// Best-effort generic rejection: send AUTH_RESPONSE(err) then close
-/// the connection. The on-wire close code is intentionally the same
-/// for all rejection reasons (spec §8.4).
-async fn reject(ctrl_send: &mut quinn::SendStream, conn: &quinn::Connection) {
+async fn reject_auth(ctrl_send: &mut quinn::SendStream, conn: &quinn::Connection) {
     if let Ok(bytes) = AuthResponse::err(STATUS_AUTH_FAILED).encode()
         && let Ok(frame) = Frame::new(FrameType::AuthResponse, bytes)
     {
         let _ = write_frame(ctrl_send, &frame).await;
     }
     conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
+}
+
+async fn handle_proxy_stream(
+    mut q_send: quinn::SendStream,
+    mut q_recv: quinn::RecvStream,
+) -> Result<()> {
+    // 1. Read PROXY_OPEN.
+    let open_frame = read_frame(&mut q_recv).await.context("read PROXY_OPEN")?;
+    if open_frame.frame_type != FrameType::ProxyOpen {
+        let _ = reject_proxy(&mut q_send, reject_codes::PROTOCOL_ERROR).await;
+        bail!("expected PROXY_OPEN, got {:?}", open_frame.frame_type);
+    }
+    let open = match ProxyOpen::decode(&open_frame.payload) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::PROTOCOL_ERROR).await;
+            bail!("malformed PROXY_OPEN: {e:#}");
+        }
+    };
+
+    if open.cmd != "tcp" {
+        let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
+        bail!("unsupported cmd {:?} (M8 = TCP only; UDP is M10)", open.cmd);
+    }
+
+    // 2. Connect to the target.
+    let target = format!("{}:{}", open.host, open.port);
+    let tcp = match TcpStream::connect(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            bail!("connect {target}: {e}");
+        }
+    };
+    println!("  proxy → tcp {target}");
+
+    // 3. PROXY_ACCEPT.
+    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
+    write_frame(&mut q_send, &accept)
+        .await
+        .context("write PROXY_ACCEPT")?;
+
+    // 4. Bridge.
+    bridge_quic_tcp(q_send, q_recv, tcp).await
+}
+
+async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> {
+    let frame = Frame::new(FrameType::ProxyReject, ProxyReject::new(reason).encode())?;
+    write_frame(q_send, &frame)
+        .await
+        .context("write PROXY_REJECT")?;
+    Ok(())
+}
+
+async fn bridge_quic_tcp(
+    mut q_send: quinn::SendStream,
+    mut q_recv: quinn::RecvStream,
+    tcp: TcpStream,
+) -> Result<()> {
+    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+
+    let q2t = async move {
+        loop {
+            let f = match read_frame(&mut q_recv).await {
+                Ok(f) => f,
+                Err(_) => break, // QUIC stream EOF
+            };
+            if f.frame_type != FrameType::Data {
+                break;
+            }
+            if !f.payload.is_empty() {
+                tcp_w.write_all(&f.payload).await?;
+            }
+        }
+        let _ = tcp_w.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let t2q = async move {
+        let mut buf = vec![0u8; PROXY_COPY_BUF];
+        loop {
+            let n = tcp_r.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
+            write_frame(&mut q_send, &frame).await?;
+        }
+        let _ = q_send.finish();
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (r1, r2) = tokio::join!(q2t, t2q);
+    r1.context("quic→tcp")?;
+    r2.context("tcp→quic")?;
+    Ok(())
 }

@@ -5,5 +5,6 @@
 pub mod auth;
 pub mod config;
 pub mod frame;
+pub mod proxy;
 pub mod replay;
 pub mod tls;

@@ -1,10 +1,12 @@
 //! PROTEUS client (v0.3 research prototype).
 //!
-//! M6: dial QUIC, on the first bidi (control stream) send an Ed25519
-//! AUTH_REQUEST signed over `"PROTEUS-v0.3-auth" || exporter || nonce`
-//! per spec v0.2 §7.3 + §8. On AUTH_RESPONSE(status=0), open a second
-//! bidi and run the M4 framed PING/PONG demo. On rejection, exit with
-//! an error.
+//! M8: dial QUIC, authenticate on the control stream, then optionally
+//! run a TCP proxy echo demo through a per-target bidi stream.
+//!
+//! With `--target HOST:PORT`: open a proxy stream to that target, send
+//! `"echo-test\n"`, expect the same bytes back, exit 0 on match.
+//! Without `--target`: exit cleanly after a successful auth (useful for
+//! sanity-checking server credentials in isolation).
 
 use std::{net::SocketAddr, path::PathBuf};
 
@@ -15,8 +17,11 @@ use proteus_core::{
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
     config::ClientConfig,
     frame::{Frame, FrameType, read_frame, write_frame},
+    proxy::{ProxyOpen, ProxyReject},
     tls,
 };
+
+const ECHO_PAYLOAD: &[u8] = b"echo-test\n";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,6 +35,10 @@ struct Cli {
     /// Path to YAML config file.
     #[arg(short, long)]
     config: PathBuf,
+
+    /// Optional TCP proxy target HOST:PORT for the M8 echo demo.
+    #[arg(short, long)]
+    target: Option<String>,
 }
 
 #[tokio::main]
@@ -45,9 +54,6 @@ async fn main() -> Result<()> {
     let mut endpoint = quinn::Endpoint::client(local).context("bind client UDP")?;
     endpoint.set_default_client_config(qcfg);
 
-    println!("proteus-client v{}", env!("CARGO_PKG_VERSION"));
-    println!("dialing {} (sni={})", cfg.server.addr, cfg.server.sni);
-
     let conn = endpoint
         .connect(cfg.server.addr, &cfg.server.sni)
         .context("connect setup")?
@@ -55,7 +61,7 @@ async fn main() -> Result<()> {
         .context("handshake")?;
     println!("connected; remote={}", conn.remote_address());
 
-    // ----- M6 auth on the control stream -----
+    // ----- auth on the control stream -----
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open ctrl bi")?;
 
     let mut exporter = [0u8; EXPORTER_LEN];
@@ -63,8 +69,7 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
 
     let req = AuthRequest::sign(&cfg.identity.client_id, &sk, &exporter)?;
-    let req_bytes = req.encode()?;
-    let req_frame = Frame::new(FrameType::AuthRequest, req_bytes)?;
+    let req_frame = Frame::new(FrameType::AuthRequest, req.encode()?)?;
     write_frame(&mut ctrl_send, &req_frame)
         .await
         .context("write AUTH_REQUEST")?;
@@ -81,21 +86,77 @@ async fn main() -> Result<()> {
     }
     println!("auth OK as {}", cfg.identity.client_id);
 
-    // ----- framed PING/PONG on a second bidi -----
-    let (mut data_send, mut data_recv) = conn.open_bi().await.context("open data bi")?;
-    let ping = Frame::new(FrameType::Ping, Bytes::new())?;
-    write_frame(&mut data_send, &ping)
-        .await
-        .context("write PING")?;
-    data_send.finish().context("finish data send")?;
-
-    let pong = read_frame(&mut data_recv).await.context("read PONG")?;
-    if pong.frame_type != FrameType::Pong {
-        bail!("expected Pong, got {:?}", pong.frame_type);
+    // ----- proxy echo demo (only with --target) -----
+    if let Some(target) = cli.target.as_deref() {
+        echo_demo(&conn, target).await?;
+    } else {
+        println!("(no --target; exiting after auth)");
     }
-    println!("framed ping/pong OK");
 
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     Ok(())
+}
+
+async fn echo_demo(conn: &quinn::Connection, target: &str) -> Result<()> {
+    let (host, port) = parse_target(target)?;
+    println!("opening proxy to {host}:{port}");
+
+    let (mut q_send, mut q_recv) = conn.open_bi().await.context("open proxy bi")?;
+
+    let open = ProxyOpen::new_tcp(host, port);
+    let open_frame = Frame::new(FrameType::ProxyOpen, open.encode()?)?;
+    write_frame(&mut q_send, &open_frame)
+        .await
+        .context("write PROXY_OPEN")?;
+
+    let resp = read_frame(&mut q_recv)
+        .await
+        .context("read PROXY_ACCEPT/REJECT")?;
+    match resp.frame_type {
+        FrameType::ProxyAccept => println!("proxy accepted"),
+        FrameType::ProxyReject => {
+            let r = ProxyReject::decode(&resp.payload)?;
+            bail!("proxy rejected: {} (0x{:02x})", r.name(), r.reason);
+        }
+        other => bail!("expected PROXY_ACCEPT/REJECT, got {other:?}"),
+    }
+
+    // Send echo payload and finish the send side.
+    let payload_frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(ECHO_PAYLOAD))?;
+    write_frame(&mut q_send, &payload_frame)
+        .await
+        .context("write echo payload")?;
+    q_send.finish().context("finish send")?;
+
+    // Concatenate DATA frame payloads until we have the echo back (or EOF).
+    let mut got = Vec::new();
+    loop {
+        let f = match read_frame(&mut q_recv).await {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+        if f.frame_type != FrameType::Data {
+            bail!("expected Data, got {:?}", f.frame_type);
+        }
+        got.extend_from_slice(&f.payload);
+        if got.len() >= ECHO_PAYLOAD.len() {
+            break;
+        }
+    }
+
+    if got == ECHO_PAYLOAD {
+        println!("echo OK ({} bytes round-tripped)", ECHO_PAYLOAD.len());
+        Ok(())
+    } else {
+        bail!("echo mismatch: sent {ECHO_PAYLOAD:?}, got {got:?}");
+    }
+}
+
+fn parse_target(s: &str) -> Result<(String, u16)> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .with_context(|| format!("target must be HOST:PORT, got {s:?}"))?;
+    let port: u16 = port.parse().context("invalid port")?;
+    Ok((host.to_string(), port))
 }
