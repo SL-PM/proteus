@@ -160,11 +160,24 @@ The cheapest path: keep the v0.3 architecture, but:
   high-fidelity copy of a real cover host's index page (fetched once
   at deploy time, served with matching headers).
 
-**Pros:** minimal code change (~200 lines). No Quinn forks. No
-upstream cover host required at runtime.
-**Cons:** the server's cert is still its own — a prober checking the
-cert sees something that isn't the cover host. Only mitigates A5
-(ALPN tell), not A6 (cert tell).
+**Pros (as originally written):** minimal code change (~200 lines).
+No Quinn forks. No upstream cover host required at runtime.
+**Cons (as originally written):** the server's cert is still its own
+— a prober checking the cert sees something that isn't the cover
+host. Only mitigates A5 (ALPN tell), not A6 (cert tell).
+
+> **2026-05-27 finding:** the "first-frame on first bidi stream"
+> discriminator doesn't survive RFC 9114 §6.2 — H3's first stream
+> from a client is *unidirectional* (control + SETTINGS), not bidi.
+> A naïve `accept_uni() vs accept_bi()` race in tokio::select is
+> also blocked: Quinn has no peek API, so consuming the H3 control
+> stream prevents `h3::server::Connection` from ever seeing
+> SETTINGS. Full analysis in
+> [`m2.4-dispatch-research.md`](m2.4-dispatch-research.md). The
+> realistic alternatives (mini-h3 server / fork `h3` / PROTEUS-over-h3)
+> are all larger than the original "~200 LOC" estimate. **Approach C
+> as written is deferred; bundle the ALPN drop with Approach B's
+> cover-host forwarding in v0.4-rc.2 or later.**
 
 ### 4.4 Recommended v0.4-rc.1 scope
 
@@ -330,8 +343,8 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | | Milestone | Approach | Effort |
 |---|---|---|---|
 | M0.4 | v0.4-dev branch + plan-doc lands | C | small |
-| M1.4 | Drop `proteus/0.3` ALPN; server advertises only `h3` | C | small |
-| M2.4 | First-frame discriminator (AUTH_REQUEST vs H3 SETTINGS) | C | small |
+| M1.4 | Drop `proteus/0.3` ALPN; server advertises only `h3` | C → B/A | **deferred** — see [m2.4-dispatch-research.md](m2.4-dispatch-research.md) |
+| M2.4 | First-frame discriminator (AUTH_REQUEST vs H3 SETTINGS) | C → B/A | **deferred** — original design infeasible w/o h3 fork or mini-h3 server |
 | M3.4 | High-fidelity decoy: configurable static HTML + headers ✅ | C | small |
 | M4.4 | PEM cert loading (M6 carry-over) | C | small |
 | M5.4 | Inner AEAD wrapper around PROTEUS frames | C | medium |
