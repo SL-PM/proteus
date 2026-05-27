@@ -4,10 +4,13 @@
 listen:
   addr: "0.0.0.0:4433"
 
-tls:
-  # Self-signed acceptable for v0.3 lab. Replace for any deployment.
-  cert: "configs/server-cert.pem"
-  key: "configs/server-key.pem"
+# Optional. PEM cert chain + private key (PKCS#8/PKCS#1/SEC1) loaded
+# from disk. If commented out, the server generates a fresh self-
+# signed cert (SAN `localhost`) on startup — convenient for local
+# dev only, NOT for any real deployment. Lands in v0.4 M4.4.
+# tls:
+#   cert: "/etc/proteus/server-cert.pem"
+#   key:  "/etc/proteus/server-key.pem"
 
 clients:
   # client_id -> base64 ed25519 public key

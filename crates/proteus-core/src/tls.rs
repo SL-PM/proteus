@@ -1,14 +1,18 @@
 //! Shared TLS / QUIC config helpers for server and client.
 //!
-//! v0.3 baseline:
-//! - Server cert: self-signed (SAN `localhost`), generated fresh on
-//!   startup. PEM loading from `[tls]` config lands in M6; in M3 the
-//!   section is parsed but ignored (with a warning to stderr).
+//! v0.4 status (M4.4 — PEM cert loading lands here):
+//! - Server cert: PEM cert chain + PKCS#8/PKCS#1/SEC1 private key
+//!   loaded from `tls.cert` / `tls.key` if the YAML config has them.
+//!   Falls back to a fresh self-signed cert (SAN `localhost`) per
+//!   startup if the `tls:` section is absent — convenient for local
+//!   dev only; **not** for any real deployment.
 //! - Client verifier: `cert_sha256` hex from config pins the leaf cert.
 //!   Empty pin = accept any (lab only).
-//! - ALPN: `proteus/0.3`. The decoy path (M13) will distinguish via `h3`.
+//! - ALPN: `proteus/0.3` and `h3`. Server dispatches on negotiated
+//!   ALPN post-handshake (M13 decoy). v0.4 M1.4+M2.4 will drop the
+//!   distinctive `proteus/0.3` ALPN; until then it stays.
 
-use std::sync::Arc;
+use std::{fs::File, io::BufReader, path::Path, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use rustls::{
@@ -41,16 +45,17 @@ pub fn default_transport_config() -> quinn::TransportConfig {
 
 /// Build a Quinn server config. Returns the chosen leaf cert too, so the
 /// caller can print its SHA-256 for clients to pin.
+///
+/// If `tls` is `Some(...)`, both files are loaded from disk as PEM. If
+/// `None`, a fresh self-signed cert is generated on every call (dev
+/// only — operators must set `tls:` for production).
 pub fn server_config(
     tls: Option<&TlsConfig>,
 ) -> Result<(quinn::ServerConfig, CertificateDer<'static>)> {
-    if tls.is_some() {
-        eprintln!(
-            "warning: M3 ignores the [tls] config section; \
-             using a generated self-signed cert. PEM loading lands in M6."
-        );
-    }
-    let (cert_der, key_der) = generate_self_signed()?;
+    let (cert_der, key_der) = match tls {
+        Some(tc) => load_pem_cert_and_key(&tc.cert, &tc.key)?,
+        None => generate_self_signed()?,
+    };
 
     let mut rustls_cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -106,6 +111,34 @@ fn generate_self_signed() -> Result<(CertificateDer<'static>, PrivateKeyDer<'sta
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
     let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into();
+    Ok((cert_der, key_der))
+}
+
+/// Load a PEM cert chain + private key from disk. Returns the leaf
+/// cert (first in the chain) plus the parsed key. Accepts PKCS#8,
+/// PKCS#1, and SEC1 key formats — rustls-pemfile detects automatically.
+fn load_pem_cert_and_key(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let cert_file =
+        File::open(cert_path).with_context(|| format!("open cert {}", cert_path.display()))?;
+    let mut rd = BufReader::new(cert_file);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("parse cert PEM {}", cert_path.display()))?;
+    let cert_der = certs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no certificates found in {}", cert_path.display()))?;
+
+    let key_file =
+        File::open(key_path).with_context(|| format!("open key {}", key_path.display()))?;
+    let mut rd = BufReader::new(key_file);
+    let key_der = rustls_pemfile::private_key(&mut rd)
+        .with_context(|| format!("parse key PEM {}", key_path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
     Ok((cert_der, key_der))
 }
 
@@ -202,6 +235,8 @@ impl ServerCertVerifier for PinnedSha256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn server_config_with_self_signed() {
@@ -235,5 +270,79 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("hex"), "got: {err}");
+    }
+
+    /// Helper: write a fresh self-signed cert + key pair as PEM to
+    /// `dir`. Returns the two paths.
+    fn write_self_signed_pem(dir: &Path) -> (PathBuf, PathBuf) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn server_config_loads_pem_cert_and_key() {
+        install_crypto_provider();
+        let dir = tempdir().unwrap();
+        let (cert_path, key_path) = write_self_signed_pem(dir.path());
+        let tls = TlsConfig {
+            cert: cert_path,
+            key: key_path,
+        };
+        let (_cfg, cert) = server_config(Some(&tls)).unwrap();
+        assert!(cert.as_ref().len() > 50);
+        let fp = cert_sha256_hex(&cert);
+        assert_eq!(fp.len(), 64);
+    }
+
+    #[test]
+    fn server_config_pem_missing_cert_errors() {
+        install_crypto_provider();
+        let dir = tempdir().unwrap();
+        let (_, key_path) = write_self_signed_pem(dir.path());
+        let tls = TlsConfig {
+            cert: dir.path().join("does-not-exist.pem"),
+            key: key_path,
+        };
+        let err = server_config(Some(&tls)).unwrap_err();
+        assert!(err.to_string().contains("open cert"), "got: {err}");
+    }
+
+    #[test]
+    fn server_config_pem_missing_key_errors() {
+        install_crypto_provider();
+        let dir = tempdir().unwrap();
+        let (cert_path, _) = write_self_signed_pem(dir.path());
+        let tls = TlsConfig {
+            cert: cert_path,
+            key: dir.path().join("does-not-exist.pem"),
+        };
+        let err = server_config(Some(&tls)).unwrap_err();
+        assert!(err.to_string().contains("open key"), "got: {err}");
+    }
+
+    #[test]
+    fn server_config_pem_garbage_cert_errors() {
+        install_crypto_provider();
+        let dir = tempdir().unwrap();
+        let cert_path = dir.path().join("garbage.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, b"not a pem cert").unwrap();
+        std::fs::write(&key_path, b"not a pem key").unwrap();
+        let tls = TlsConfig {
+            cert: cert_path,
+            key: key_path,
+        };
+        let err = server_config(Some(&tls)).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("certif") || msg.contains("no certificates"),
+            "got: {err}"
+        );
     }
 }

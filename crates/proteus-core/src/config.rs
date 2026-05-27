@@ -136,8 +136,11 @@ mod tests {
         assert!(policy.block_private_ranges);
         assert!(policy.allowed_ports.contains(&443));
         assert!(!policy.allow_udp);
-        let tls = cfg.tls.expect("tls section present in example");
-        assert!(tls.cert.ends_with("server-cert.pem"));
+        // The `tls:` section is commented out in the example as of
+        // v0.4 M4.4 — server falls back to a self-signed cert when
+        // absent, which is the safer default for an example anyone
+        // can copy-paste. See docs/CONFIG.md.
+        assert!(cfg.tls.is_none(), "example should have tls commented out");
     }
 
     #[test]
