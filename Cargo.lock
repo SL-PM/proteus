@@ -1363,13 +1363,18 @@ name = "proteus-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
+ "ed25519-dalek",
  "h3",
  "h3-quinn",
  "http",
  "proteus-core",
  "quinn",
+ "rand 0.8.6",
+ "rustls",
+ "tempfile",
  "tokio",
 ]
 
