@@ -110,6 +110,68 @@ impl ProxyReject {
     }
 }
 
+/// Buffer size for one TCP → QUIC chunk; each chunk becomes one DATA frame.
+pub const BRIDGE_BUF_SIZE: usize = 8192;
+
+/// Bidirectional bridge between a Quinn (send, recv) pair carrying PROTEUS
+/// DATA frames and an arbitrary AsyncRead/AsyncWrite split (typically a TCP
+/// socket). Used by the server to bridge a proxy stream to its upstream
+/// TCP socket, and by the M9 SOCKS5 client to bridge an incoming SOCKS5
+/// socket to a freshly opened proxy stream.
+///
+/// Returns when either direction reaches EOF (or errors). The QUIC-side
+/// EOF is signaled by `read_frame` returning Err or by any non-DATA frame;
+/// the TCP-side EOF is the usual zero-length read.
+pub async fn bridge_quic_tcp<R, W>(
+    mut q_send: quinn::SendStream,
+    mut q_recv: quinn::RecvStream,
+    mut tcp_r: R,
+    mut tcp_w: W,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    use crate::frame::{Frame, FrameType, read_frame, write_frame};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let q2t = async move {
+        loop {
+            let f = match read_frame(&mut q_recv).await {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if f.frame_type != FrameType::Data {
+                break;
+            }
+            if !f.payload.is_empty() {
+                tcp_w.write_all(&f.payload).await?;
+            }
+        }
+        let _ = tcp_w.shutdown().await;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let t2q = async move {
+        let mut buf = vec![0u8; BRIDGE_BUF_SIZE];
+        loop {
+            let n = tcp_r.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
+            write_frame(&mut q_send, &frame).await?;
+        }
+        let _ = q_send.finish();
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let (r1, r2) = tokio::join!(q2t, t2q);
+    r1.context("quic→tcp bridge")?;
+    r2.context("tcp→quic bridge")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

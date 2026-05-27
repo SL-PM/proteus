@@ -1,12 +1,13 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M8: M7 auth + replay cache, plus per-target TCP proxy streams (spec
-//! v0.2 §9). For each connection:
+//! M8: auth + replay cache + per-target TCP proxy streams (spec v0.2 §9).
+//! For each connection:
 //!   1. accept control stream, run auth + replay check
 //!   2. on success: AUTH_RESPONSE(ok), then loop `accept_bi()` for
 //!      additional bidi streams. Each is treated as a proxy stream:
 //!      read PROXY_OPEN, attempt `TcpStream::connect`, then either
-//!      PROXY_ACCEPT + bridge DATA ↔ raw TCP, or PROXY_REJECT(reason).
+//!      PROXY_ACCEPT + bridge DATA ↔ raw TCP (via
+//!      [`proteus_core::proxy::bridge_quic_tcp`]), or PROXY_REJECT(reason).
 //!   3. on auth failure: `H3_GENERAL_PROTOCOL_ERROR` close (no plaintext)
 //!
 //! Policy (M12), UDP (M10), and decoy (M13) still missing.
@@ -22,14 +23,11 @@ use proteus_core::{
     },
     config::ServerConfig,
     frame::{Frame, FrameType, read_frame, write_frame},
-    proxy::{ProxyOpen, ProxyReject, reject as reject_codes},
+    proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
     replay::ReplayCache,
     tls,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
 
 /// QUIC application close code on auth failure — same family as
 /// `H3_GENERAL_PROTOCOL_ERROR` per spec v0.2 §8.4.
@@ -40,9 +38,6 @@ const REPLAY_TTL: Duration = Duration::from_secs(300);
 
 /// How often to sweep expired entries from the replay cache.
 const REPLAY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Buffer size for TCP → QUIC chunks. Each chunk becomes one DATA frame.
-const PROXY_COPY_BUF: usize = 8192;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -80,7 +75,7 @@ async fn main() -> Result<()> {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
     println!();
-    println!("M8: auth + replay cache + TCP proxy. Ctrl-C to stop.");
+    println!("auth + replay cache + TCP proxy. Ctrl-C to stop.");
 
     spawn_replay_sweeper(replay.clone());
 
@@ -233,7 +228,8 @@ async fn handle_proxy_stream(
         .context("write PROXY_ACCEPT")?;
 
     // 4. Bridge.
-    bridge_quic_tcp(q_send, q_recv, tcp).await
+    let (tcp_r, tcp_w) = tcp.into_split();
+    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
 }
 
 async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> {
@@ -241,49 +237,5 @@ async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> 
     write_frame(q_send, &frame)
         .await
         .context("write PROXY_REJECT")?;
-    Ok(())
-}
-
-async fn bridge_quic_tcp(
-    mut q_send: quinn::SendStream,
-    mut q_recv: quinn::RecvStream,
-    tcp: TcpStream,
-) -> Result<()> {
-    let (mut tcp_r, mut tcp_w) = tcp.into_split();
-
-    let q2t = async move {
-        loop {
-            let f = match read_frame(&mut q_recv).await {
-                Ok(f) => f,
-                Err(_) => break, // QUIC stream EOF
-            };
-            if f.frame_type != FrameType::Data {
-                break;
-            }
-            if !f.payload.is_empty() {
-                tcp_w.write_all(&f.payload).await?;
-            }
-        }
-        let _ = tcp_w.shutdown().await;
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let t2q = async move {
-        let mut buf = vec![0u8; PROXY_COPY_BUF];
-        loop {
-            let n = tcp_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
-            write_frame(&mut q_send, &frame).await?;
-        }
-        let _ = q_send.finish();
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let (r1, r2) = tokio::join!(q2t, t2q);
-    r1.context("quic→tcp")?;
-    r2.context("tcp→quic")?;
     Ok(())
 }
