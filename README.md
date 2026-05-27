@@ -141,6 +141,11 @@ subcommands.
 
 ## License
 
-Documents: CC-BY-SA 4.0.
-Code: not yet licensed; please ask before any redistribution. A
-proper license will be chosen before any v0.4 / external release.
+- **Code**: GNU Affero General Public License v3.0 or later
+  (`AGPL-3.0-or-later`). See [`LICENSE`](LICENSE) for the full text.
+- **Documents** (everything under `docs/`): CC-BY-SA 4.0.
+
+The AGPL choice is deliberate for a circumvention tool: forks that
+operate the server as a network service must publish their
+modifications, so the protocol stays open even if someone builds a
+hosted product around it.

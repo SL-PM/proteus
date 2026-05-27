@@ -3,6 +3,7 @@ name = "proteus-tools"
 version = "0.1.0"
 edition = "2024"
 default-run = "proteus-tools"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
