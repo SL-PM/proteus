@@ -347,7 +347,8 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | M2.4 | First-frame discriminator (AUTH_REQUEST vs H3 SETTINGS) | C → B/A | **deferred** — original design infeasible w/o h3 fork or mini-h3 server |
 | M3.4 | High-fidelity decoy: configurable static HTML + headers ✅ | C | small |
 | M4.4 | PEM cert loading (M6 carry-over) | C | small |
-| M5.4 | Inner AEAD wrapper around PROTEUS frames | C | medium |
+| M5.4 | Inner AEAD primitives (`aead::InnerAead`, key derivation, per-stream subkeys) ✅ | C | medium |
+| M5.4.1 | Wire-format AEAD wrapping: all proxy-stream frames go through `read_frame_aead` / `write_frame_aead`; AAD binds `(frame_type, flags, stream_id)`; TCP+UDP smoke pass ✅ | C | medium |
 | M6.4 | 0-RTT resumption + replay-safety analysis ⚠️ config-only; integration test → M9.4. See [`m6.4-zero-rtt.md`](m6.4-zero-rtt.md) | C | medium |
 | M7.4 | Connection migration (mostly Quinn) ✅ — see [`m7.4-connection-migration.md`](m7.4-connection-migration.md) | C | small |
 | M8.4 | Operator-facing fetch-decoy-on-startup utility | C | small |

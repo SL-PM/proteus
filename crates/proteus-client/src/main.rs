@@ -20,9 +20,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use proteus_core::{
+    aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
     config::ClientConfig,
-    frame::{Frame, FrameType, read_frame, write_frame},
+    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
     tls,
 };
@@ -106,6 +107,13 @@ async fn main() -> Result<()> {
     }
     println!("auth OK as {}", cfg.identity.client_id);
 
+    // M5.4.1: derive the inner-AEAD session key. Per-proxy-stream
+    // subkeys come out of ProxyStreamAead::for_client.
+    let session_key: Arc<[u8; aead::KEY_LEN]> = Arc::new(
+        aead::InnerAead::derive_key(&exporter, &req.nonce)
+            .expect("derive_key: exporter + nonce are non-empty post-auth"),
+    );
+
     // ----- SOCKS5 listener -----
     let conn = Arc::new(conn);
     let listener = TcpListener::bind(cfg.socks5.listen)
@@ -117,15 +125,20 @@ async fn main() -> Result<()> {
     loop {
         let (sock, peer) = listener.accept().await.context("accept SOCKS5")?;
         let conn = conn.clone();
+        let session_key = session_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, conn).await {
+            if let Err(e) = handle_socks5(sock, conn, session_key).await {
                 eprintln!("socks5 {peer}: {e:#}");
             }
         });
     }
 }
 
-async fn handle_socks5(mut sock: TcpStream, qconn: Arc<quinn::Connection>) -> Result<()> {
+async fn handle_socks5(
+    mut sock: TcpStream,
+    qconn: Arc<quinn::Connection>,
+    session_key: Arc<[u8; aead::KEY_LEN]>,
+) -> Result<()> {
     // ----- Greeting: [ver, nmethods, methods...] -----
     let mut hdr = [0u8; 2];
     sock.read_exact(&mut hdr).await.context("read greeting")?;
@@ -187,18 +200,24 @@ async fn handle_socks5(mut sock: TcpStream, qconn: Arc<quinn::Connection>) -> Re
     let port = u16::from_be_bytes(port_buf);
     println!("SOCKS5 CONNECT {host}:{port}");
 
-    // ----- Open QUIC proxy stream + PROXY_OPEN -----
+    // ----- Open QUIC proxy stream + PROXY_OPEN (AEAD-wrapped) -----
     let (mut q_send, mut q_recv) = qconn.open_bi().await.context("open proxy bi")?;
-    let open = ProxyOpen::new_tcp(&host, port);
-    write_frame(
-        &mut q_send,
-        &Frame::new(FrameType::ProxyOpen, open.encode()?)?,
-    )
-    .await
-    .context("write PROXY_OPEN")?;
+    let stream_id = q_send.id().index();
+    let mut sa = ProxyStreamAead::for_client(&session_key, stream_id);
 
-    // ----- Wait for PROXY_ACCEPT / PROXY_REJECT -----
-    let resp = read_frame(&mut q_recv)
+    let open = ProxyOpen::new_tcp(&host, port);
+    let open_frame = Frame {
+        frame_type: FrameType::ProxyOpen,
+        flags: 0,
+        stream_id,
+        payload: open.encode()?,
+    };
+    write_frame_aead(&mut q_send, &open_frame, &mut sa.send)
+        .await
+        .context("write PROXY_OPEN")?;
+
+    // ----- Wait for PROXY_ACCEPT / PROXY_REJECT (AEAD-wrapped) -----
+    let resp = read_frame_aead(&mut q_recv, &mut sa.recv)
         .await
         .context("read PROXY_ACCEPT/REJECT")?;
     let rep = match resp.frame_type {
@@ -224,7 +243,7 @@ async fn handle_socks5(mut sock: TcpStream, qconn: Arc<quinn::Connection>) -> Re
 
     // ----- Bridge SOCKS5 socket ↔ QUIC proxy stream -----
     let (tcp_r, tcp_w) = sock.into_split();
-    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
+    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w, sa.send, sa.recv).await
 }
 
 async fn send_socks5_reply(sock: &mut TcpStream, rep: u8) -> Result<()> {

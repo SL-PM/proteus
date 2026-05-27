@@ -26,11 +26,12 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use clap::Parser;
 use proteus_core::{
+    aead::{self, ProxyStreamAead},
     auth::{
         AuthRequest, AuthResponse, ClientRegistry, EXPORTER_LABEL, EXPORTER_LEN, STATUS_AUTH_FAILED,
     },
     config::ServerConfig,
-    frame::{Frame, FrameType, read_frame, write_frame},
+    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     metrics::Metrics,
     policy::PolicyChecker,
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
@@ -319,14 +320,24 @@ async fn handle_conn(
     metrics.active_session_inc();
     println!("{peer}: auth OK as {client_id}");
 
+    // M5.4.1: derive the inner-AEAD session key. Each per-target
+    // stream further derives its own subkey from this via the QUIC
+    // stream id (`ProxyStreamAead::for_server`).
+    let session_key: Arc<[u8; aead::KEY_LEN]> = Arc::new(
+        aead::InnerAead::derive_key(&exporter, &req.nonce)
+            .expect("derive_key: exporter + nonce are non-empty post-auth"),
+    );
+
     // ----- per-target proxy streams -----
     let peer_label = format!("{peer}/{client_id}");
     while let Ok((q_send, q_recv)) = conn.accept_bi().await {
         let label = peer_label.clone();
         let policy = policy.clone();
         let metrics = metrics.clone();
+        let session_key = session_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy, metrics).await {
+            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy, metrics, session_key).await
+            {
                 eprintln!("proxy {label}: {e:#}");
             }
         });
@@ -350,16 +361,37 @@ async fn handle_proxy_stream(
     mut q_recv: quinn::RecvStream,
     policy: Option<Arc<PolicyChecker>>,
     metrics: Arc<Metrics>,
+    session_key: Arc<[u8; aead::KEY_LEN]>,
 ) -> Result<()> {
-    let open_frame = read_frame(&mut q_recv).await.context("read PROXY_OPEN")?;
+    // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
+    // post-auth. Derive this stream's key + (send, recv) pair from the
+    // session key plus the QUIC stream id.
+    let stream_id = q_send.id().index();
+    let mut sa = ProxyStreamAead::for_server(&session_key, stream_id);
+
+    let open_frame = read_frame_aead(&mut q_recv, &mut sa.recv)
+        .await
+        .context("read PROXY_OPEN")?;
     if open_frame.frame_type != FrameType::ProxyOpen {
-        let _ = reject_proxy(&mut q_send, reject_codes::PROTOCOL_ERROR).await;
+        let _ = reject_proxy(
+            &mut q_send,
+            reject_codes::PROTOCOL_ERROR,
+            &mut sa.send,
+            stream_id,
+        )
+        .await;
         bail!("expected PROXY_OPEN, got {:?}", open_frame.frame_type);
     }
     let open = match ProxyOpen::decode(&open_frame.payload) {
         Ok(o) => o,
         Err(e) => {
-            let _ = reject_proxy(&mut q_send, reject_codes::PROTOCOL_ERROR).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::PROTOCOL_ERROR,
+                &mut sa.send,
+                stream_id,
+            )
+            .await;
             bail!("malformed PROXY_OPEN: {e:#}");
         }
     };
@@ -373,6 +405,9 @@ async fn handle_proxy_stream(
                 open.port,
                 policy.as_deref(),
                 &metrics,
+                sa.send,
+                sa.recv,
+                stream_id,
             )
             .await
         }
@@ -384,19 +419,38 @@ async fn handle_proxy_stream(
                 open.port,
                 policy.as_deref(),
                 &metrics,
+                sa.send,
+                sa.recv,
+                stream_id,
             )
             .await
         }
         other => {
-            let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::UNSUPPORTED_CMD,
+                &mut sa.send,
+                stream_id,
+            )
+            .await;
             bail!("unsupported cmd {other:?}");
         }
     }
 }
 
-async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> {
-    let frame = Frame::new(FrameType::ProxyReject, ProxyReject::new(reason).encode())?;
-    write_frame(q_send, &frame)
+async fn reject_proxy(
+    q_send: &mut quinn::SendStream,
+    reason: u8,
+    aead_send: &mut aead::InnerAead,
+    stream_id: u64,
+) -> Result<()> {
+    let frame = Frame {
+        frame_type: FrameType::ProxyReject,
+        flags: 0,
+        stream_id,
+        payload: ProxyReject::new(reason).encode(),
+    };
+    write_frame_aead(q_send, &frame, aead_send)
         .await
         .context("write PROXY_REJECT")?;
     Ok(())
@@ -413,6 +467,7 @@ async fn resolve_target(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_tcp(
     mut q_send: quinn::SendStream,
     q_recv: quinn::RecvStream,
@@ -420,12 +475,21 @@ async fn proxy_to_tcp(
     port: u16,
     policy: Option<&PolicyChecker>,
     metrics: &Metrics,
+    mut aead_send: aead::InnerAead,
+    aead_recv: aead::InnerAead,
+    stream_id: u64,
 ) -> Result<()> {
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
             metrics.proxy_upstream_unreachable_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::UPSTREAM_UNREACHABLE,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -434,7 +498,13 @@ async fn proxy_to_tcp(
         let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
         if let Err(e) = p.check_tcp(port, &ips) {
             metrics.policy_rejected_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::POLICY_DENIED,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             bail!("policy denied tcp {host}:{port}: {e}");
         }
     }
@@ -443,22 +513,34 @@ async fn proxy_to_tcp(
         Ok(s) => s,
         Err(e) => {
             metrics.proxy_upstream_unreachable_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::UPSTREAM_UNREACHABLE,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             bail!("tcp connect {host}:{port} ({}): {e}", resolved[0]);
         }
     };
     println!("  proxy → tcp {host}:{port} ({})", resolved[0]);
 
-    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
-    write_frame(&mut q_send, &accept)
+    let accept = Frame {
+        frame_type: FrameType::ProxyAccept,
+        flags: 0,
+        stream_id,
+        payload: Bytes::new(),
+    };
+    write_frame_aead(&mut q_send, &accept, &mut aead_send)
         .await
         .context("write PROXY_ACCEPT")?;
 
     metrics.proxy_tcp_opened_inc();
     let (tcp_r, tcp_w) = tcp.into_split();
-    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
+    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w, aead_send, aead_recv).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn proxy_to_udp(
     mut q_send: quinn::SendStream,
     q_recv: quinn::RecvStream,
@@ -466,12 +548,21 @@ async fn proxy_to_udp(
     port: u16,
     policy: Option<&PolicyChecker>,
     metrics: &Metrics,
+    mut aead_send: aead::InnerAead,
+    aead_recv: aead::InnerAead,
+    stream_id: u64,
 ) -> Result<()> {
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
             metrics.proxy_upstream_unreachable_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::UPSTREAM_UNREACHABLE,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -480,7 +571,13 @@ async fn proxy_to_udp(
         let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
         if let Err(e) = p.check_udp(port, &ips) {
             metrics.policy_rejected_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::POLICY_DENIED,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             bail!("policy denied udp {host}:{port}: {e}");
         }
     }
@@ -489,24 +586,41 @@ async fn proxy_to_udp(
         Ok(s) => s,
         Err(e) => {
             metrics.proxy_upstream_unreachable_inc();
-            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            let _ = reject_proxy(
+                &mut q_send,
+                reject_codes::UPSTREAM_UNREACHABLE,
+                &mut aead_send,
+                stream_id,
+            )
+            .await;
             bail!("udp bind: {e}");
         }
     };
     if let Err(e) = udp.connect(&resolved[0]).await {
         metrics.proxy_upstream_unreachable_inc();
-        let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+        let _ = reject_proxy(
+            &mut q_send,
+            reject_codes::UPSTREAM_UNREACHABLE,
+            &mut aead_send,
+            stream_id,
+        )
+        .await;
         bail!("udp connect {host}:{port} ({}): {e}", resolved[0]);
     }
     println!("  proxy → udp {host}:{port} ({})", resolved[0]);
 
-    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
-    write_frame(&mut q_send, &accept)
+    let accept = Frame {
+        frame_type: FrameType::ProxyAccept,
+        flags: 0,
+        stream_id,
+        payload: Bytes::new(),
+    };
+    write_frame_aead(&mut q_send, &accept, &mut aead_send)
         .await
         .context("write PROXY_ACCEPT")?;
 
     metrics.proxy_udp_opened_inc();
-    proxy::bridge_quic_udp(q_send, q_recv, udp).await
+    proxy::bridge_quic_udp(q_send, q_recv, udp, aead_send, aead_recv).await
 }
 
 // ---------------- M13 H3 decoy ----------------

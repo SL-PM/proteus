@@ -80,6 +80,9 @@ pub const DIR_S2C: u32 = 0x0000_0001;
 /// layer key derivation in later PROTEUS versions.
 const HKDF_INFO: &[u8] = b"PROTEUS-v0.4-inner-aead";
 
+/// HKDF `info` parameter for per-stream subkey derivation (M5.4.1).
+const STREAM_INFO: &[u8] = b"PROTEUS-v0.4-stream";
+
 /// Per-direction AEAD state. Each peer holds two of these (one for
 /// sending, one for receiving). The key bytes are shared between both
 /// halves; the direction tag in the nonce keeps the streams
@@ -104,6 +107,25 @@ impl InnerAead {
         hk.expand(HKDF_INFO, &mut okm)
             .map_err(|_| anyhow::anyhow!("HKDF expand failed"))?;
         Ok(okm)
+    }
+
+    /// Derive a per-stream subkey from the session key + the QUIC
+    /// stream id (M5.4.1). Each proxy stream gets its own AEAD key so
+    /// parallel streams in the same direction can independently start
+    /// their counters at 0 without colliding nonces.
+    ///
+    /// ```text
+    /// stream_key = HKDF-SHA256(salt = stream_id (big-endian u64),
+    ///                          ikm  = session_key,
+    ///                          info = "PROTEUS-v0.4-stream")
+    /// ```
+    pub fn derive_stream_key(session_key: &[u8; KEY_LEN], stream_id: u64) -> [u8; KEY_LEN] {
+        let salt = stream_id.to_be_bytes();
+        let hk = Hkdf::<Sha256>::new(Some(&salt), session_key);
+        let mut okm = [0u8; KEY_LEN];
+        hk.expand(STREAM_INFO, &mut okm)
+            .expect("HKDF expand never fails with 32-byte output");
+        okm
     }
 
     /// Build an `InnerAead` for the given direction. Counter starts at 0.
@@ -160,7 +182,44 @@ impl InnerAead {
             .map_err(|e| anyhow::anyhow!("AEAD open: {e:?}"))?;
         Ok(Bytes::from(pt))
     }
+}
 
+/// Convenience: the AEAD state a single proxy stream needs, plus the
+/// stream id its frames carry as AAD. Both peers derive an instance
+/// for every proxy bidi they open / accept; `for_server` and
+/// `for_client` differ only in which direction tag goes to `send`
+/// and which to `recv`.
+pub struct ProxyStreamAead {
+    pub send: InnerAead,
+    pub recv: InnerAead,
+    pub stream_id: u64,
+}
+
+impl ProxyStreamAead {
+    /// Build for the server side. Server receives client→server
+    /// frames and sends server→client frames.
+    pub fn for_server(session_key: &[u8; KEY_LEN], stream_id: u64) -> Self {
+        let key = InnerAead::derive_stream_key(session_key, stream_id);
+        Self {
+            send: InnerAead::for_direction(&key, DIR_S2C),
+            recv: InnerAead::for_direction(&key, DIR_C2S),
+            stream_id,
+        }
+    }
+
+    /// Build for the client side. Client sends client→server frames
+    /// and receives server→client frames.
+    pub fn for_client(session_key: &[u8; KEY_LEN], stream_id: u64) -> Self {
+        let key = InnerAead::derive_stream_key(session_key, stream_id);
+        Self {
+            send: InnerAead::for_direction(&key, DIR_C2S),
+            recv: InnerAead::for_direction(&key, DIR_S2C),
+            stream_id,
+        }
+    }
+}
+
+impl InnerAead {
     fn next_nonce(&mut self) -> Result<[u8; NONCE_LEN]> {
         let mut n = [0u8; NONCE_LEN];
         n[0..8].copy_from_slice(&self.counter.to_be_bytes());
@@ -301,5 +360,51 @@ mod tests {
         let ct1 = s.seal(b"payload-a", b"").unwrap();
         let ct2 = s.seal(b"payload-b", b"").unwrap();
         assert_ne!(ct1, ct2);
+    }
+
+    // ----- M5.4.1 derive_stream_key tests -----
+
+    #[test]
+    fn stream_key_is_deterministic() {
+        let session = InnerAead::derive_key(EXPORTER, SESSION_NONCE).unwrap();
+        let k1 = InnerAead::derive_stream_key(&session, 42);
+        let k2 = InnerAead::derive_stream_key(&session, 42);
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn stream_keys_differ_by_stream_id() {
+        let session = InnerAead::derive_key(EXPORTER, SESSION_NONCE).unwrap();
+        let k0 = InnerAead::derive_stream_key(&session, 0);
+        let k1 = InnerAead::derive_stream_key(&session, 1);
+        let k2 = InnerAead::derive_stream_key(&session, 0xFFFF_FFFF_FFFF_FFFF);
+        assert_ne!(k0, k1);
+        assert_ne!(k0, k2);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn stream_key_differs_from_session_key() {
+        let session = InnerAead::derive_key(EXPORTER, SESSION_NONCE).unwrap();
+        let stream = InnerAead::derive_stream_key(&session, 0);
+        assert_ne!(session, stream);
+    }
+
+    #[test]
+    fn two_streams_same_counter_zero_distinct_ciphertexts() {
+        // Different per-stream keys mean each stream's counter=0 frame
+        // produces a different ciphertext, so there is no nonce reuse
+        // across parallel proxy streams.
+        let session = InnerAead::derive_key(EXPORTER, SESSION_NONCE).unwrap();
+        let key_a = InnerAead::derive_stream_key(&session, 100);
+        let key_b = InnerAead::derive_stream_key(&session, 200);
+        let mut a = InnerAead::for_direction(&key_a, DIR_C2S);
+        let mut b = InnerAead::for_direction(&key_b, DIR_C2S);
+        let ct_a = a.seal(b"identical", b"identical-aad").unwrap();
+        let ct_b = b.seal(b"identical", b"identical-aad").unwrap();
+        assert_ne!(
+            ct_a, ct_b,
+            "different stream keys must produce different ciphertexts"
+        );
     }
 }

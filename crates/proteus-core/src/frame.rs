@@ -116,6 +116,59 @@ impl Frame {
     }
 }
 
+/// Inner-AEAD wire wrapping (M5.4.1).
+///
+/// Returns the 12-byte AAD for a frame's AEAD seal/open: 2 bytes
+/// frame_type + 2 bytes flags + 8 bytes stream_id. `payload_len` is
+/// intentionally NOT included — its value depends on the sealed size
+/// (a chicken-and-egg dependency on the AEAD output). Excluding it
+/// costs nothing for security: the AEAD tag covers the payload bytes
+/// anyway, and the other three fields bind the frame to its routing
+/// context.
+pub fn aad_for_frame_header(frame_type: FrameType, flags: u16, stream_id: u64) -> [u8; 12] {
+    let mut aad = [0u8; 12];
+    aad[0..2].copy_from_slice(&(frame_type as u16).to_be_bytes());
+    aad[2..4].copy_from_slice(&flags.to_be_bytes());
+    aad[4..12].copy_from_slice(&stream_id.to_be_bytes());
+    aad
+}
+
+/// Write a frame whose payload is AEAD-sealed with `aead` (M5.4.1).
+/// The on-wire `payload_len` field reflects the sealed (ciphertext +
+/// 16-byte tag) size. Counter advances by 1.
+pub async fn write_frame_aead<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &Frame,
+    aead: &mut crate::aead::InnerAead,
+) -> Result<()> {
+    let aad = aad_for_frame_header(frame.frame_type, frame.flags, frame.stream_id);
+    let sealed = aead.seal(&frame.payload, &aad)?;
+    let wrapped = Frame {
+        frame_type: frame.frame_type,
+        flags: frame.flags,
+        stream_id: frame.stream_id,
+        payload: sealed,
+    };
+    write_frame(writer, &wrapped).await
+}
+
+/// Read a frame whose payload was AEAD-sealed by the peer (M5.4.1).
+/// Returns the frame with the plaintext payload. Counter advances by 1.
+pub async fn read_frame_aead<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    aead: &mut crate::aead::InnerAead,
+) -> Result<Frame> {
+    let raw = read_frame(reader).await?;
+    let aad = aad_for_frame_header(raw.frame_type, raw.flags, raw.stream_id);
+    let plaintext = aead.open(&raw.payload, &aad)?;
+    Ok(Frame {
+        frame_type: raw.frame_type,
+        flags: raw.flags,
+        stream_id: raw.stream_id,
+        payload: plaintext,
+    })
+}
+
 /// Read one frame from any `AsyncRead`. Reads exactly the header, then
 /// exactly the announced payload length.
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame> {
@@ -243,6 +296,68 @@ mod tests {
         w.unwrap();
         let got = r.unwrap();
         assert_eq!(got, f);
+    }
+
+    #[tokio::test]
+    async fn aead_frame_roundtrip_over_duplex() {
+        use crate::aead::{DIR_C2S, InnerAead};
+        let session = InnerAead::derive_key(
+            b"exp-32bytes-of-test-material-aa",
+            b"nonce-32-bytes-of-test-input-bb",
+        )
+        .unwrap();
+        let stream_key = InnerAead::derive_stream_key(&session, 0x1234_5678);
+        let mut send = InnerAead::for_direction(&stream_key, DIR_C2S);
+        let mut recv = InnerAead::for_direction(&stream_key, DIR_C2S);
+
+        let (mut a, mut b) = tokio::io::duplex(256);
+        let mut f = Frame::new(FrameType::Data, &b"hello-aead"[..]).unwrap();
+        f.stream_id = 0x1234_5678;
+
+        let (w, r) = tokio::join!(
+            write_frame_aead(&mut a, &f, &mut send),
+            read_frame_aead(&mut b, &mut recv)
+        );
+        w.unwrap();
+        let got = r.unwrap();
+        assert_eq!(got.payload.as_ref(), b"hello-aead");
+        assert_eq!(got.stream_id, 0x1234_5678);
+    }
+
+    #[tokio::test]
+    async fn aead_frame_aad_binds_stream_id() {
+        // Sender seals with stream_id=A. Receiver opens with stream_id=B
+        // (changed in flight) — AAD mismatch → AEAD fails.
+        use crate::aead::{DIR_C2S, InnerAead};
+        let session = InnerAead::derive_key(
+            b"exp-32bytes-of-test-material-aa",
+            b"nonce-32-bytes-of-test-input-bb",
+        )
+        .unwrap();
+        let stream_key = InnerAead::derive_stream_key(&session, 1);
+        let mut send = InnerAead::for_direction(&stream_key, DIR_C2S);
+
+        let mut f = Frame::new(FrameType::Data, &b"x"[..]).unwrap();
+        f.stream_id = 1;
+        let sealed_bytes = send
+            .seal(&f.payload, &aad_for_frame_header(f.frame_type, f.flags, 1))
+            .unwrap();
+
+        // Try to open with stream_id=2 in the AAD.
+        let mut recv = InnerAead::for_direction(&stream_key, DIR_C2S);
+        let result = recv.open(
+            &sealed_bytes,
+            &aad_for_frame_header(f.frame_type, f.flags, 2),
+        );
+        assert!(result.is_err(), "AAD with different stream_id must reject");
+    }
+
+    #[test]
+    fn aad_for_frame_header_encodes_be() {
+        let aad = aad_for_frame_header(FrameType::Data, 0xABCD, 0x0123_4567_89AB_CDEF);
+        assert_eq!(&aad[0..2], &(FrameType::Data as u16).to_be_bytes());
+        assert_eq!(&aad[2..4], &0xABCD_u16.to_be_bytes());
+        assert_eq!(&aad[4..12], &0x0123_4567_89AB_CDEF_u64.to_be_bytes());
     }
 
     #[test]

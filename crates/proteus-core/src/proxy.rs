@@ -127,17 +127,21 @@ pub async fn bridge_quic_tcp<R, W>(
     mut q_recv: quinn::RecvStream,
     mut tcp_r: R,
     mut tcp_w: W,
+    mut aead_send: crate::aead::InnerAead,
+    mut aead_recv: crate::aead::InnerAead,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWrite + Unpin + Send,
 {
-    use crate::frame::{Frame, FrameType, read_frame, write_frame};
+    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stream_id = q_send.id().index();
 
     let q2t = async move {
         loop {
-            let f = match read_frame(&mut q_recv).await {
+            let f = match read_frame_aead(&mut q_recv, &mut aead_recv).await {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -159,8 +163,13 @@ where
             if n == 0 {
                 break;
             }
-            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
-            write_frame(&mut q_send, &frame).await?;
+            let frame = Frame {
+                frame_type: FrameType::Data,
+                flags: 0,
+                stream_id,
+                payload: Bytes::copy_from_slice(&buf[..n]),
+            };
+            write_frame_aead(&mut q_send, &frame, &mut aead_send).await?;
         }
         let _ = q_send.finish();
         Ok::<(), anyhow::Error>(())
@@ -186,14 +195,18 @@ pub async fn bridge_quic_udp(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
     udp: tokio::net::UdpSocket,
+    mut aead_send: crate::aead::InnerAead,
+    mut aead_recv: crate::aead::InnerAead,
 ) -> anyhow::Result<()> {
     use std::{sync::Arc, time::Duration};
 
-    use crate::frame::{Frame, FrameType, read_frame, write_frame};
+    use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead};
 
     /// Max IPv4 UDP datagram payload (65535 - 8 UDP - 20 IP).
     const UDP_RECV_BUF: usize = 65_507;
     const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+    let stream_id = q_send.id().index();
 
     let udp = Arc::new(udp);
     let udp_send = udp.clone();
@@ -201,7 +214,7 @@ pub async fn bridge_quic_udp(
 
     let q2u = async move {
         loop {
-            let f = match read_frame(&mut q_recv).await {
+            let f = match read_frame_aead(&mut q_recv, &mut aead_recv).await {
                 Ok(f) => f,
                 Err(_) => break,
             };
@@ -219,8 +232,13 @@ pub async fn bridge_quic_udp(
         let mut buf = vec![0u8; UDP_RECV_BUF];
         loop {
             let n = udp_recv.recv(&mut buf).await?;
-            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
-            write_frame(&mut q_send, &frame).await?;
+            let frame = Frame {
+                frame_type: FrameType::Data,
+                flags: 0,
+                stream_id,
+                payload: Bytes::copy_from_slice(&buf[..n]),
+            };
+            write_frame_aead(&mut q_send, &frame, &mut aead_send).await?;
         }
         // The loop above is divergent; this Ok exists so the async
         // block's return type can be inferred as Result<(), _>.

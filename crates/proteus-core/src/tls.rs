@@ -28,25 +28,22 @@ use crate::config::TlsConfig;
 pub const ALPN: &[u8] = b"proteus/0.3";
 
 /// Maximum bytes of 0-RTT early data the server will buffer per
-/// resumed connection (M6.4). Sized to comfortably fit one
-/// AUTH_REQUEST frame (HEADER_LEN + cid_len + nonce + sig ≈ 130 B)
-/// plus headroom for future v0.4+ control-frame chatter.
+/// resumed connection (M6.4).
+///
+/// **Quinn constraint**: `quinn-proto`'s rustls glue panics unless this
+/// value is exactly `0` (0-RTT disabled) or `u32::MAX = 2^32-1` (0-RTT
+/// enabled, no application-level cap). Intermediate values fail with
+/// `"QUIC sessions must set a max early data of 0 or 2^32-1"`. We pick
+/// `u32::MAX` to enable 0-RTT; size-bounding is delegated to PROTEUS's
+/// application-layer frame parser (which only ever expects an
+/// AUTH_REQUEST frame on the early-data path, ~130 B).
 ///
 /// Replay-safety reasoning lives in `docs/m6.4-zero-rtt.md`. Short
 /// version: AUTH_REQUEST is the only thing PROTEUS clients send in
 /// the early-data window; the existing per-client (client_id, nonce)
 /// replay cache (M7) catches replayed AUTH_REQUESTs whether they
 /// arrive over 0-RTT or 1-RTT.
-pub const MAX_EARLY_DATA_BYTES: u32 = 16 * 1024;
-
-// Compile-time guard against accidentally setting MAX_EARLY_DATA_BYTES
-// too small to fit an AUTH_REQUEST. If this assertion ever fires, a
-// future refactor has dropped the value below the minimum needed for
-// one 0-RTT auth attempt.
-const _: () = assert!(
-    MAX_EARLY_DATA_BYTES >= 256,
-    "MAX_EARLY_DATA_BYTES must fit at least one AUTH_REQUEST frame"
-);
+pub const MAX_EARLY_DATA_BYTES: u32 = u32::MAX;
 
 /// Install the default rustls crypto provider. Idempotent.
 pub fn install_crypto_provider() {

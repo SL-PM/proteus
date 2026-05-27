@@ -13,9 +13,10 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use proteus_core::{
+    aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
     config::ClientConfig,
-    frame::{Frame, FrameType, read_frame, write_frame},
+    frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     proxy::{ProxyOpen, ProxyReject},
     tls,
 };
@@ -79,18 +80,28 @@ pub async fn run(args: Args) -> Result<()> {
     }
     println!("auth OK as {}", cfg.identity.client_id);
 
-    // ----- UDP proxy stream -----
+    // M5.4.1: derive session_key from exporter + auth nonce.
+    let session_key =
+        aead::InnerAead::derive_key(&exporter, &req.nonce).context("derive session key")?;
+
+    // ----- UDP proxy stream (AEAD-wrapped) -----
     let (host, port) = parse_target(&args.target)?;
     let (mut q_send, mut q_recv) = conn.open_bi().await.context("open udp proxy bi")?;
-    let open = ProxyOpen::new_udp(&host, port);
-    write_frame(
-        &mut q_send,
-        &Frame::new(FrameType::ProxyOpen, open.encode()?)?,
-    )
-    .await
-    .context("write PROXY_OPEN")?;
+    let stream_id = q_send.id().index();
+    let mut sa = ProxyStreamAead::for_client(&session_key, stream_id);
 
-    let resp_frame = read_frame(&mut q_recv)
+    let open = ProxyOpen::new_udp(&host, port);
+    let open_frame = Frame {
+        frame_type: FrameType::ProxyOpen,
+        flags: 0,
+        stream_id,
+        payload: open.encode()?,
+    };
+    write_frame_aead(&mut q_send, &open_frame, &mut sa.send)
+        .await
+        .context("write PROXY_OPEN")?;
+
+    let resp_frame = read_frame_aead(&mut q_recv, &mut sa.recv)
         .await
         .context("read PROXY_ACCEPT/REJECT")?;
     match resp_frame.frame_type {
@@ -102,17 +113,24 @@ pub async fn run(args: Args) -> Result<()> {
         other => bail!("expected PROXY_ACCEPT/REJECT, got {other:?}"),
     }
 
-    // Send one datagram-worth of payload as a single DATA frame.
+    // Send one datagram-worth of payload as a single DATA frame (AEAD-wrapped).
     let payload = Bytes::copy_from_slice(args.payload.as_bytes());
-    write_frame(&mut q_send, &Frame::new(FrameType::Data, payload.clone())?)
+    let data_frame = Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id,
+        payload: payload.clone(),
+    };
+    write_frame_aead(&mut q_send, &data_frame, &mut sa.send)
         .await
         .context("write DATA")?;
     q_send.finish().context("finish send")?;
 
     // Wait for one DATA frame back (the echo).
-    let response = tokio::time::timeout(RESPONSE_TIMEOUT, read_frame(&mut q_recv))
-        .await
-        .context("timeout waiting for UDP echo response")??;
+    let response =
+        tokio::time::timeout(RESPONSE_TIMEOUT, read_frame_aead(&mut q_recv, &mut sa.recv))
+            .await
+            .context("timeout waiting for UDP echo response")??;
     if response.frame_type != FrameType::Data {
         bail!("expected DATA reply, got {:?}", response.frame_type);
     }
