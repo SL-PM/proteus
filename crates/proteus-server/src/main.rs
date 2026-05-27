@@ -100,6 +100,17 @@ async fn main() -> Result<()> {
     let metrics = Arc::new(Metrics::new());
     let rate_limiter = Arc::new(AuthRateLimiter::new(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW));
 
+    // M3.4: load decoy HTML from disk if `decoy.static_page` is set;
+    // otherwise fall back to the embedded nginx welcome page.
+    let decoy_html: Arc<Vec<u8>> = match cfg.decoy.as_ref() {
+        Some(d) => {
+            let bytes = std::fs::read(&d.static_page)
+                .with_context(|| format!("read decoy {}", d.static_page.display()))?;
+            Arc::new(bytes)
+        }
+        None => Arc::new(DEFAULT_DECOY_HTML.to_vec()),
+    };
+
     println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
     println!("listening on: {}", endpoint.local_addr()?);
     println!("cert sha256:  {}", tls::cert_sha256_hex(&cert));
@@ -122,6 +133,15 @@ async fn main() -> Result<()> {
         rate_limiter.max_per_window(),
         rate_limiter.window().as_secs()
     );
+    println!(
+        "decoy:        {} ({} bytes)",
+        if cfg.decoy.is_some() {
+            "file"
+        } else {
+            "embedded default (nginx welcome)"
+        },
+        decoy_html.len()
+    );
     if registry.is_empty() {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
@@ -138,9 +158,18 @@ async fn main() -> Result<()> {
         let policy = policy.clone();
         let metrics = metrics.clone();
         let rate_limiter = rate_limiter.clone();
+        let decoy_html = decoy_html.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_conn(incoming, registry, replay, policy, metrics, rate_limiter).await
+            if let Err(e) = handle_conn(
+                incoming,
+                registry,
+                replay,
+                policy,
+                metrics,
+                rate_limiter,
+                decoy_html,
+            )
+            .await
             {
                 eprintln!("conn error: {e:#}");
             }
@@ -201,6 +230,7 @@ async fn handle_conn(
     policy: Option<Arc<PolicyChecker>>,
     metrics: Arc<Metrics>,
     rate_limiter: Arc<AuthRateLimiter>,
+    decoy_html: Arc<Vec<u8>>,
 ) -> Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = conn.remote_address();
@@ -210,7 +240,7 @@ async fn handle_conn(
     // touching the auth path.
     if negotiated_alpn(&conn).as_deref() == Some(H3_ALPN) {
         println!("accepted {peer}: h3 decoy");
-        if let Err(e) = serve_h3_decoy(conn).await {
+        if let Err(e) = serve_h3_decoy(conn, decoy_html).await {
             eprintln!("h3 decoy {peer}: {e:#}");
         }
         return Ok(());
@@ -489,19 +519,44 @@ fn negotiated_alpn(conn: &quinn::Connection) -> Option<Vec<u8>> {
         .and_then(|hd| hd.protocol)
 }
 
-/// Static HTML body the H3 decoy returns to any request. Intentionally
-/// generic — no PROTEUS branding leaks. v0.4 REALITY-style upstream
-/// forwarding will replace this with bytes from a real cover host.
-const DECOY_HTML: &[u8] = b"<!DOCTYPE html>\n\
-<html lang=\"en\">\n\
-<head><meta charset=\"utf-8\"><title>Welcome</title></head>\n\
-<body><h1>It works.</h1></body>\n\
+/// Default HTML body the H3 decoy returns when no `decoy.static_page`
+/// is set in the server config. Byte-identical to the nginx welcome
+/// page so a prober sees a plausible default-nginx-install response.
+/// Overridden at startup by an operator-supplied file if the config
+/// has `decoy.static_page` — M3.4.
+const DEFAULT_DECOY_HTML: &[u8] = b"<!DOCTYPE html>\n\
+<html>\n\
+<head>\n\
+<title>Welcome to nginx!</title>\n\
+<style>\n\
+    body {\n\
+        width: 35em;\n\
+        margin: 0 auto;\n\
+        font-family: Tahoma, Verdana, Arial, sans-serif;\n\
+    }\n\
+</style>\n\
+</head>\n\
+<body>\n\
+<h1>Welcome to nginx!</h1>\n\
+<p>If you see this page, the nginx web server is successfully installed and\n\
+working. Further configuration is required.</p>\n\
+\n\
+<p>For online documentation and support please refer to\n\
+<a href=\"http://nginx.org/\">nginx.org</a>.<br/>\n\
+Commercial support is available at\n\
+<a href=\"http://nginx.com/\">nginx.com</a>.</p>\n\
+\n\
+<p><em>Thank you for using nginx.</em></p>\n\
+</body>\n\
 </html>\n";
 
-/// M13 decoy — serve a static 200 OK to any H3 request on this QUIC
-/// connection. Shares the server cert with the PROTEUS path so a
-/// casual prober sees a coherent host. Spec v0.2 §11.
-async fn serve_h3_decoy(conn: quinn::Connection) -> Result<()> {
+/// M13 + M3.4 decoy — serve a static 200 OK to any H3 request on this
+/// QUIC connection, using the operator-supplied HTML body (or the
+/// embedded nginx welcome default). Headers (`server`, `accept-ranges`,
+/// `content-type`) mirror a default nginx install so a passive prober
+/// sees a coherent fake cover host. Shares the server cert with the
+/// PROTEUS path. Spec v0.2 §11.
+async fn serve_h3_decoy(conn: quinn::Connection, body: Arc<Vec<u8>>) -> Result<()> {
     let h3_q = h3_quinn::Connection::new(conn);
     let mut h3_conn: h3::server::Connection<_, bytes::Bytes> =
         h3::server::Connection::new(h3_q).await?;
@@ -518,11 +573,13 @@ async fn serve_h3_decoy(conn: quinn::Connection) -> Result<()> {
                 };
                 let resp = http::Response::builder()
                     .status(200)
+                    .header("server", "nginx/1.27.0")
                     .header("content-type", "text/html; charset=utf-8")
+                    .header("accept-ranges", "bytes")
                     .body(())?;
                 stream.send_response(resp).await?;
                 stream
-                    .send_data(bytes::Bytes::from_static(DECOY_HTML))
+                    .send_data(bytes::Bytes::copy_from_slice(&body))
                     .await?;
                 stream.finish().await?;
             }

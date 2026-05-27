@@ -332,7 +332,7 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | M0.4 | v0.4-dev branch + plan-doc lands | C | small |
 | M1.4 | Drop `proteus/0.3` ALPN; server advertises only `h3` | C | small |
 | M2.4 | First-frame discriminator (AUTH_REQUEST vs H3 SETTINGS) | C | small |
-| M3.4 | High-fidelity decoy: configurable static HTML + headers | C | small |
+| M3.4 | High-fidelity decoy: configurable static HTML + headers ✅ | C | small |
 | M4.4 | PEM cert loading (M6 carry-over) | C | small |
 | M5.4 | Inner AEAD wrapper around PROTEUS frames | C | medium |
 | M6.4 | 0-RTT resumption + replay-safety analysis | C | medium |
