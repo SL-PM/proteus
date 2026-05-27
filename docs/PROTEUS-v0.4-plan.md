@@ -336,7 +336,7 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | M4.4 | PEM cert loading (M6 carry-over) | C | small |
 | M5.4 | Inner AEAD wrapper around PROTEUS frames | C | medium |
 | M6.4 | 0-RTT resumption + replay-safety analysis | C | medium |
-| M7.4 | Connection migration (mostly Quinn) | C | small |
+| M7.4 | Connection migration (mostly Quinn) ✅ — see [`m7.4-connection-migration.md`](m7.4-connection-migration.md) | C | small |
 | M8.4 | Operator-facing fetch-decoy-on-startup utility | C | small |
 | M9.4 | v0.4-rc.1 sign-off: capture + comparison vs cover host | C | medium |
 | M10.4 | (stretch) Approach B: own real cert for proxy host | B | large |

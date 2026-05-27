@@ -32,9 +32,12 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Default transport config for both server and client. Caps the QUIC
-/// idle timeout at 30 seconds so a stalled connection cannot hold a
-/// server slot forever (M18 hardening — slow-loris bound).
+/// Default transport config for both server and client.
+///
+/// - Caps the QUIC idle timeout at 30 seconds (M18 — slow-loris bound).
+/// - Leaves connection migration ON (Quinn default). PROTEUS's
+///   replay cache is keyed on `client_id` not 5-tuple, so a migration
+///   doesn't disturb the auth state. See `docs/m7.4-connection-migration.md`.
 pub fn default_transport_config() -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
