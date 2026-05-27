@@ -27,6 +27,27 @@ use crate::config::TlsConfig;
 /// ALPN identifier for PROTEUS v0.3 traffic.
 pub const ALPN: &[u8] = b"proteus/0.3";
 
+/// Maximum bytes of 0-RTT early data the server will buffer per
+/// resumed connection (M6.4). Sized to comfortably fit one
+/// AUTH_REQUEST frame (HEADER_LEN + cid_len + nonce + sig ≈ 130 B)
+/// plus headroom for future v0.4+ control-frame chatter.
+///
+/// Replay-safety reasoning lives in `docs/m6.4-zero-rtt.md`. Short
+/// version: AUTH_REQUEST is the only thing PROTEUS clients send in
+/// the early-data window; the existing per-client (client_id, nonce)
+/// replay cache (M7) catches replayed AUTH_REQUESTs whether they
+/// arrive over 0-RTT or 1-RTT.
+pub const MAX_EARLY_DATA_BYTES: u32 = 16 * 1024;
+
+// Compile-time guard against accidentally setting MAX_EARLY_DATA_BYTES
+// too small to fit an AUTH_REQUEST. If this assertion ever fires, a
+// future refactor has dropped the value below the minimum needed for
+// one 0-RTT auth attempt.
+const _: () = assert!(
+    MAX_EARLY_DATA_BYTES >= 256,
+    "MAX_EARLY_DATA_BYTES must fit at least one AUTH_REQUEST frame"
+);
+
 /// Install the default rustls crypto provider. Idempotent.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -66,6 +87,8 @@ pub fn server_config(
     // Server advertises both PROTEUS and HTTP/3. Post-handshake the
     // bin dispatches on the negotiated ALPN (M13 decoy).
     rustls_cfg.alpn_protocols = vec![ALPN.to_vec(), b"h3".to_vec()];
+    // M6.4: opt into 0-RTT resumption. rustls defaults to 0 (disabled).
+    rustls_cfg.max_early_data_size = MAX_EARLY_DATA_BYTES;
 
     let mut qcfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)?,
