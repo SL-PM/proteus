@@ -29,6 +29,10 @@ clap, tcpdump/Wireshark/qlog-style capture tooling.
 - **§5 Recommended Implementation Order updated** to reflect the new sequence
   (M0 → M5 → M1 → M2 → M3 → M4 → M6 → ...).
 - All other milestone numbers are unchanged so external references survive.
+- **M11 (Remote DNS) is implicit in v0.3.** No separate code commit lands —
+  the server always resolves the target via `tokio::net::lookup_host` on the
+  M8/M9/M10 path, so there is no client-side-resolve mode to opt out of.
+  Marked accordingly in the M11 section below.
 
 ---
 
@@ -217,9 +221,14 @@ Client exposes `127.0.0.1:1080` SOCKS5 CONNECT, translates to PROXY_OPEN.
 Minimal UDP echo. Pick ONE of: length-prefixed datagrams over QUIC streams,
 OR QUIC DATAGRAM frames. Document the choice and tradeoff.
 
-### M11 — Remote DNS Mode
+### M11 — Remote DNS Mode ✓ (implicit; no separate commit)
 
-Server resolves hostnames sent by client (SOCKS5 `--socks5-hostname` style).
+Server resolves hostnames sent by client. **Already implemented in M8/M9/M10**:
+the client passes the host string verbatim in `PROXY_OPEN.host` (CBOR), and
+the server calls `tokio::net::lookup_host((host, port))` before policy/connect.
+There is no separate "client-side resolve" mode in v0.3 — every target is
+resolved server-side, which matches the security-stronger SOCKS5
+`--socks5-hostname` semantics by default.
 
 ### M12 — Policy Engine
 
