@@ -1,9 +1,9 @@
 # PROTEUS
 
-> **Status: v0.3 working research prototype.**
-> All 19 roadmap milestones complete in code or doc. 11/12 DoD items
-> met — the last (fingerprint comparison report) requires a manual
-> capture run with sudo + curl-with-http3.
+> **Status: v0.4.0 working research prototype — Approach C complete.**
+> Adds inner AEAD wire wrapping, TLS 1.3 0-RTT, QUIC connection
+> migration, and a high-fidelity H3 decoy (byte-identical body +
+> mirrored response headers from a chosen cover host) on top of v0.3.
 
 ## What this is
 
@@ -12,18 +12,23 @@ REALITY's indistinguishability idea, Hysteria2's QUIC transport, and
 exporter-bound Ed25519 client auth.
 
 - Long-term vision: [`docs/PROTEUS-spec-v0.1.md`](docs/PROTEUS-spec-v0.1.md).
-- v0.3 prototype scope (what this repo actually implements):
+- v0.3 prototype scope:
   [`docs/PROTEUS-spec-v0.2.md`](docs/PROTEUS-spec-v0.2.md).
 - v0.3 implementation milestones:
   [`docs/ROADMAP-v0.3.md`](docs/ROADMAP-v0.3.md).
+- **v0.4 design + sign-off:**
+  [`docs/PROTEUS-v0.4-plan.md`](docs/PROTEUS-v0.4-plan.md) +
+  [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md).
 
 ## ⚠️ Not a production tool
 
-v0.3 is **DPI-detectable by design** — REALITY-style upstream
-forwarding is deferred to v0.4, post-quantum crypto to v1.0. Do not
-deploy v0.3 as a circumvention tool in any adversarial environment.
+v0.4 is **still DPI-detectable by design** at the connection envelope
+(distinctive `proteus/0.3` ALPN, fixed packet-size pattern). True
+ALPN unification + REALITY-style upstream relay is v1.0 work. Do not
+deploy v0.4 as a circumvention tool in any adversarial environment.
 See [`docs/THREAT-MODEL-v0.3.md`](docs/THREAT-MODEL-v0.3.md) for the
-full statement.
+full statement (still accurate for v0.4 — same threat model, more
+hardening inside the tunnel).
 
 ## Quick start
 
@@ -69,31 +74,74 @@ cargo run --bin proteus-tools -- udp-test \
     --config /tmp/client.yaml --target 1.1.1.1:53 --payload "..."
 ```
 
-## Milestones (M0–M19)
+## v0.4 highlights
+
+What changed since v0.3.0-rc.1:
+
+- **Inner AEAD over PROTEUS frames** (M5.4 + M5.4.1). All proxy-stream
+  frames are ChaCha20-Poly1305-sealed inside the QUIC TLS tunnel with
+  per-stream subkeys (HKDF over the stream-id).
+- **TLS 1.3 0-RTT resumption** (M6.4). Server opts in; replay safety
+  analysis in [`docs/m6.4-zero-rtt.md`](docs/m6.4-zero-rtt.md).
+- **QUIC connection migration** (M7.4). `(client_id, nonce)` cache
+  survives 5-tuple changes. Integration test asserts an active proxy
+  stream rides over `endpoint.rebind()`.
+- **PEM cert + key loading** (M4.4). Operators no longer constrained
+  to self-signed dev certs.
+- **High-fidelity H3 decoy** (M3.4 + M8.4 + M8.4.1):
+  - `proteus-tools fetch-decoy --url ... --out body.html --out-headers headers.json`
+    snapshots a real cover host's body **and** response-header set.
+  - Server serves byte-identical body + mirrored headers (27
+    cloudflare-style headers vs. 3 hardcoded nginx-style before).
+  - `date:` regenerated per-request; hop-by-hop / `content-length`
+    handled correctly. See
+    [`docs/CONFIG.md`](docs/CONFIG.md#high-fidelity-decoy-v04-m34--m84--m841).
+- **Server-as-library** (M9.4). `proteus-server::Server` exposes
+  `bind/run/shutdown/metrics` so integration tests spin it up
+  in-process; the bin is now a ~80-line wrapper. Auth, migration,
+  and 0-RTT regression tests live under
+  [`crates/proteus-server/tests/`](crates/proteus-server/tests/).
+
+Known v0.4 limitations (honestly documented, deferred to v0.5+):
+
+- `proteus/0.3` ALPN still advertised. Unification needs an h3 fork
+  or mini-h3 server — see
+  [`docs/m2.4-dispatch-research.md`](docs/m2.4-dispatch-research.md).
+  Re-scoped as v1.0 work.
+- Decoy header mirroring is byte-identical *from the snapshot*; a few
+  cover-host headers are per-request unique (e.g. cloudflare's
+  `cf-ray`, `__cf_bm`) so a prober making two requests sees the same
+  values. True fix = live decoy-proxy (Approach B, v0.5+).
+- Wire-pattern padding / timing jitter not yet implemented (closes
+  A5). v0.5 scope.
+
+## Milestones
+
+### v0.3 (M0–M19)
+
+All 19 milestones complete in code or doc. M14 sign-off captured
+in [`docs/m14-comparison-report.md`](docs/m14-comparison-report.md).
+v0.3.0-rc.1 tagged 2026-05-27.
+
+### v0.4 (M0.4–M9.4)
 
 | | Milestone | Status |
 |---|---|:---:|
-| M0 | Cargo workspace bootstrap | ✅ |
-| M1 | YAML config + clap CLI | ✅ |
-| M2 | `proteus-tools keygen` (Ed25519, base64 .key/.pub, mode 0600) | ✅ |
-| M3 | Basic QUIC ping/pong | ✅ |
-| M4 | PROTEUS frame envelope (spec §7.2) | ✅ |
-| M5 | TLS exporter spike — Path A confirmed | ✅ |
-| M6 | Exporter-bound Ed25519 auth on control stream | ✅ |
-| M7 | Per-client `(client_id, nonce)` replay cache | ✅ |
-| M8 | TCP proxy over QUIC + CBOR PROXY_OPEN | ✅ |
-| M9 | SOCKS5 CONNECT frontend daemon | ✅ |
-| M10 | UDP proxy + `proteus-tools udp-test` | ✅ |
-| M11 | Remote DNS — **implicit** in the M8/M9/M10 design | ✅ |
-| M12 | Server-side policy engine | ✅ |
-| M13 | Local HTTP/3 decoy on ALPN `h3` | ✅ |
-| M14 | Invalid-client handling | ⚠️ code-path done; pcap sign-off pending |
-| M15 | Capture tooling (`scripts/capture-*.sh`) | ✅ |
-| M16 | Fingerprint profile YAML schema | ✅ |
-| M17 | Runtime metrics counters + periodic snapshot | ✅ |
-| M18 | Connection idle timeout + AUTH_REQUEST read timeout | ✅ |
-| M18.1 | Per-IP auth rate limit + frame decode fuzz | ✅ |
-| M19 | Post-quantum feasibility note (forward-looking) | ✅ |
+| M0.4 | v0.4-dev branch + plan doc | ✅ |
+| M1.4 | Drop `proteus/0.3` ALPN | ⏸ deferred → v1.0 |
+| M2.4 | First-frame discriminator | ⏸ deferred → v1.0 |
+| M3.4 | High-fidelity decoy (nginx default) | ✅ |
+| M4.4 | PEM cert+key loading | ✅ |
+| M5.4 | Inner AEAD primitives | ✅ |
+| M5.4.1 | Wire-format AEAD wrapping | ✅ |
+| M6.4 | TLS 1.3 0-RTT (config-level) | ✅ |
+| M7.4 | Connection migration | ✅ |
+| M8.4 | `fetch-decoy` utility (body) | ✅ |
+| M8.4.1 | Decoy response-header mirroring | ✅ |
+| M9.4 | Server-as-library + integration tests + sign-off | ✅ |
+
+Full milestone matrix:
+[`docs/PROTEUS-v0.4-plan.md`](docs/PROTEUS-v0.4-plan.md) §9.
 
 ## Documents
 
@@ -101,43 +149,53 @@ cargo run --bin proteus-tools -- udp-test \
 |---|---|
 | [`docs/PROTEUS-spec-v0.1.md`](docs/PROTEUS-spec-v0.1.md) | Long-term vision (May 2026 draft) |
 | [`docs/PROTEUS-spec-v0.2.md`](docs/PROTEUS-spec-v0.2.md) | v0.3 prototype scope + wire formats |
-| [`docs/ROADMAP-v0.3.md`](docs/ROADMAP-v0.3.md) | Implementation milestones M0–M19 |
-| [`docs/THREAT-MODEL-v0.3.md`](docs/THREAT-MODEL-v0.3.md) | A1–A11 with coverage matrix |
-| [`docs/CONFIG.md`](docs/CONFIG.md) | Per-field YAML reference |
-| [`docs/m14-invalid-client.md`](docs/m14-invalid-client.md) | M14 status + sign-off acceptance criteria |
-| [`docs/spike-m5-exporter.md`](docs/spike-m5-exporter.md) | M5 result note |
+| [`docs/ROADMAP-v0.3.md`](docs/ROADMAP-v0.3.md) | v0.3 implementation milestones |
+| [`docs/PROTEUS-v0.4-plan.md`](docs/PROTEUS-v0.4-plan.md) | v0.4 design, milestone matrix, stretch goals |
+| [`docs/THREAT-MODEL-v0.3.md`](docs/THREAT-MODEL-v0.3.md) | A1–A11 coverage matrix |
+| [`docs/CONFIG.md`](docs/CONFIG.md) | Per-field YAML reference + high-fidelity-decoy walkthrough |
+| [`docs/m6.4-zero-rtt.md`](docs/m6.4-zero-rtt.md) | 0-RTT design + Quinn-rustls quirks |
+| [`docs/m7.4-connection-migration.md`](docs/m7.4-connection-migration.md) | Migration design |
+| [`docs/m2.4-dispatch-research.md`](docs/m2.4-dispatch-research.md) | Why ALPN unification needs v1.0 scope |
+| [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md) | v0.4-rc.1 acceptance evidence |
+| [`docs/m14-comparison-report.md`](docs/m14-comparison-report.md) | v0.3 wire fingerprint baseline |
 | [`docs/spike-m19-pq.md`](docs/spike-m19-pq.md) | Post-quantum feasibility for v1.0 |
 | [`docs/fingerprint-profile.example.yaml`](docs/fingerprint-profile.example.yaml) | M16 schema for v0.5 fingerprint work |
+| [`CHANGELOG.md`](CHANGELOG.md) | Per-release changes since project start |
 | [`scripts/README.md`](scripts/README.md) | M15 capture-and-compare tooling |
 
-## Threat-model summary (one-line)
+## Threat-model summary (v0.4)
 
-- **In scope and covered in v0.3:** A1 passive interception, A2
-  unauthorized client (Ed25519), A3 replay (nonce cache), A4 casual
-  port-prober (M13 H3 decoy).
-- **Out of scope for v0.3:** A5 DPI / A6 cert inspection / A7
-  statistical analysis / A8 IP-block / A9 PQ / A10 global passive /
-  A11 endpoint compromise. See the threat-model doc for which
-  milestone closes each.
+- **In scope and covered:** A1 passive interception (QUIC TLS + inner
+  AEAD), A2 unauthorized client (Ed25519), A3 replay (`(client_id,
+  nonce)` cache, survives QUIC migration), A4 casual port-prober
+  (M13/M3.4/M8.4/M8.4.1 H3 decoy now byte-identical to cover host
+  modulo per-request-unique cf-ray etc.).
+- **Out of scope until later:** A5 active DPI / A6 cert inspection /
+  A7 statistical analysis / A8 IP-block / A9 PQ / A10 global passive
+  / A11 endpoint compromise. See the threat-model doc.
 
 ## Build / test
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 73 tests (68 core + 5 tools)
+cargo test  --workspace        # 121 tests (96 core + 5 server-lib + 14 tools + 6 server-integration)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Architecture (one paragraph)
 
-`proteus-core` is the shared library: `auth`, `config`, `frame`,
-`metrics`, `policy`, `proxy`, `ratelimit`, `replay`, `tls`. The
-binary crates are thin: `proteus-server` runs auth + replay + policy
-+ rate-limit + per-target TCP/UDP proxy streams + H3 decoy fallback;
-`proteus-client` runs an auth-once daemon with a SOCKS5 CONNECT
-frontend; `proteus-tools` ships `keygen` and `udp-test`
-subcommands.
+`proteus-core` is the shared library: `aead`, `auth`, `config`,
+`decoy`, `frame`, `metrics`, `policy`, `proxy`, `ratelimit`, `replay`,
+`tls`. `proteus-server` is now a library + thin bin — the library
+crate (`proteus_server::Server`) exposes `bind/run/shutdown/metrics`
+for in-process integration tests; the bin parses CLI args and prints
+the startup banner. `proteus-client` is a SOCKS5 CONNECT daemon
+that pays auth once, then opens fresh per-target proxy streams
+(AEAD-wrapped). `proteus-tools` ships `keygen` (Ed25519 keypair
+generator), `udp-test` (one-shot UDP echo through a server), and
+`fetch-decoy` (snapshots cover-host body + headers for the H3
+decoy).
 
 ## License
 

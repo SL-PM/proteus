@@ -4,6 +4,44 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.4.0] — 2026-05-27
+
+**Approach C complete.** No code changes vs. v0.4.0-rc.2; this is
+the stabilizing release after two RCs with no follow-up issues. The
+v0.4.0 tag is the canonical "Approach C done" reference point for
+anyone reading the repo or pulling a release artifact.
+
+What v0.4.0 means in practice:
+
+* All M0.4–M9.4 milestones shipped (M1.4 + M2.4 explicitly deferred
+  to v1.0 per `docs/m2.4-dispatch-research.md`).
+* H3 decoy returns byte-identical body + cover-host-mirrored
+  response headers from a snapshot. Closes the v0.4 fingerprint gap
+  documented in M9.4 sign-off §2.6.
+* Inner ChaCha20-Poly1305 AEAD wraps every proxy-stream frame inside
+  the QUIC TLS tunnel, with per-stream subkeys (HKDF over stream-id).
+* TLS 1.3 0-RTT enabled at the config layer; replay-safety analysis
+  in `docs/m6.4-zero-rtt.md`.
+* QUIC connection migration works transparently — `(client_id, nonce)`
+  cache survives 5-tuple changes; integration test pins this.
+* `proteus-server` refactored into a library + thin bin. Auth +
+  migration + 0-RTT regression tests live in
+  `crates/proteus-server/tests/`.
+
+Documented residual leaks (v0.5+ work, see CONFIG.md):
+
+* `proteus/0.3` ALPN still distinctive.
+* Static-snapshot leaks: `cf-ray`, `__cf_bm` echoed unchanged. True
+  fix = live decoy-proxy (Approach B, deferred).
+* No wire-pattern padding / timing jitter yet (closes A5, v0.5).
+
+121 tests pass. fmt + clippy -D warnings clean.
+
+### Commits since v0.4.0-rc.2
+
+* `7574650` docs(changelog): v0.4.0-rc.2 entry — M8.4.1 header-mirroring
+* (no further code changes — README updated as part of the v0.4.0 polish pass)
+
 ## [v0.4.0-rc.2] — 2026-05-27
 
 Single-milestone polish release on top of v0.4.0-rc.1: closes the
