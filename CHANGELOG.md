@@ -4,6 +4,41 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.4.0-rc.2] — 2026-05-27
+
+Single-milestone polish release on top of v0.4.0-rc.1: closes the
+H3-decoy response-header divergence documented in the rc.1 sign-off
+(`docs/m9.4-rc1-signoff.md` §2.6).
+
+**Highlights:**
+
+* **M8.4.1 — Decoy response-header mirroring.** The H3 decoy now
+  echoes the cover host's full header set 1:1 (modulo hop-by-hop +
+  stale `date:`). Before: 3 hardcoded nginx-style headers. After:
+  27 cloudflare-style headers including `server`, `cache-control`,
+  `strict-transport-security`, the full ~3 KB CSP, `link` preload
+  hints, `set-cookie`, `alt-svc`, `cf-*`, `x-*` tracking headers,
+  `nel`, `report-to`, etc. Plus a fresh per-request `date:`.
+* `proteus-tools fetch-decoy --out-headers <path>` — new flag.
+  Writes the snapshotted headers as JSON alongside the body. Both
+  files are referenced from server config (`decoy.static_headers`).
+* Backward-compatible: `static_headers` is optional. Missing =
+  M3.4 hardcoded behavior.
+
+**Known residual leaks (honestly documented in CONFIG.md):** some
+headers are per-request unique on the real cover host (`cf-ray`,
+`__cf_bm` cookie value) and PROTEUS echoes the static snapshot;
+some headers are intermittent on the real host but always present
+in PROTEUS responses (`server`, `alt-svc`, `nel`, `report-to`).
+True fix = live decoy-proxy mode (Approach B in v0.4-plan §6),
+v0.5+ work.
+
+121 tests pass (+12 since rc.1). fmt + clippy -D warnings clean.
+
+### Commits since v0.4.0-rc.1
+
+* `5dd2c7e` feat(m8.4.1): decoy response-header mirroring (snapshot + serve)
+
 ## [v0.4.0-rc.1] — 2026-05-27
 
 Approach C complete. Adds inner AEAD over PROTEUS frames, TLS 1.3
