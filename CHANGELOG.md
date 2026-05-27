@@ -4,6 +4,71 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.4.0-rc.1] — 2026-05-27
+
+Approach C complete. Adds inner AEAD over PROTEUS frames, TLS 1.3
+0-RTT resumption (config-level), connection migration, high-fidelity
+H3 decoy snapshotting, and integration-test coverage for all of it.
+See [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md) for the
+formal sign-off + acceptance evidence.
+
+**Highlights:**
+
+* **Inner AEAD wire layer (M5.4 + M5.4.1).** All proxy-stream frames
+  are now ChaCha20-Poly1305-sealed inside the QUIC TLS tunnel. Key
+  derivation: `HKDF(salt=stream_id_be, ikm=session_key, info=...)`
+  to avoid nonce reuse across parallel streams. AAD binds frame
+  type / flags / stream id.
+* **High-fidelity H3 decoy (M3.4 + M8.4).** The H3 decoy serves
+  byte-identical body to a chosen cover host (e.g. cloudflare.com).
+  `proteus-tools fetch-decoy --url ... --out file.html` snapshots
+  the cover host at deploy time; sign-off verified SHA-256 match
+  against a live cloudflare.com fetch.
+* **TLS 1.3 0-RTT (M6.4).** Server opts in via
+  `MAX_EARLY_DATA_BYTES = u32::MAX` (Quinn requires this exact
+  value or 0); replay-safety analysis documented. Live happy-path
+  trigger deferred; regression test in place.
+* **Connection migration (M7.4).** Quinn default + PROTEUS's
+  client-id-keyed cache makes 5-tuple changes free. Integration
+  test verifies an active proxy stream survives `endpoint.rebind()`.
+* **PEM cert+key loading (M4.4).** Previously self-signed-only.
+* **Server-as-library refactor (M9.4).** `proteus-server::Server`
+  exposes `bind`/`run`/`shutdown`/`metrics()` so integration tests
+  spin the server up in-process. Bin shrunk 708 → ~80 lines.
+* **Three new integration test binaries** in
+  `crates/proteus-server/tests/`: auth smoke, migration, 0-RTT.
+* **CONFIG.md** gets a "high-fidelity decoy" section walking
+  operators through the fetch-decoy + decoy.static_page flow.
+
+**Deferred (documented):**
+
+* M1.4 + M2.4 (ALPN unification / first-frame discriminator) —
+  infeasible without forking h3 or writing a mini-h3 server, see
+  [`docs/m2.4-dispatch-research.md`](docs/m2.4-dispatch-research.md).
+  Re-classified as v1.0-scope.
+* Decoy response *header* mirroring — body is byte-identical, but
+  headers still nginx-style. v0.5.
+* Deterministic real-0-RTT acceptance test (rustls ticket-cache
+  timing). Not blocking — production short-lived-client scenario
+  doesn't exist yet for PROTEUS.
+
+109 tests pass (91 core + 12 tools + 6 server integration).
+fmt + clippy -D warnings clean.
+
+### Commits since v0.3.0-rc.1 (oldest first)
+
+* `3b1e76a` docs(v0.4): PROTEUS-v0.4-plan.md design draft
+* `c35292b` feat(m4.4): PEM cert+key loading for proteus-core::tls
+* `7288baf` feat(m5.4): inner AEAD primitives (proteus-core::aead)
+* `02e70a2` docs(m7.4): connection migration — Quinn default + replay-cache design
+* `5be0025` feat(m3.4): high-fidelity decoy — nginx welcome page + headers + file override
+* `a605eaa` docs(m2.4): dispatch research — Approach C as written is infeasible
+* `5e67bc8` feat(m6.4): enable TLS 1.3 0-RTT resumption (config-level)
+* `a3c20ba` feat(m5.4.1): wire-format AEAD wrapping for all proxy-stream frames
+* `330e5e1` feat(m8.4): proteus-tools fetch-decoy — snapshot cover-host index for H3 decoy
+* `97fc809` feat(m9.4): server-as-library refactor + auth/migration/0-RTT integration tests
+* `6a337e8` docs(m9.4): v0.4-rc.1 sign-off — high-fidelity decoy proven byte-identical
+
 ## [v0.3.0-rc.1] — 2026-05-27
 
 Initial PROTEUS v0.3 research-prototype release. Protocol-complete
