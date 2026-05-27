@@ -36,6 +36,7 @@ use proteus_core::{
         AuthRequest, AuthResponse, ClientRegistry, EXPORTER_LABEL, EXPORTER_LEN, STATUS_AUTH_FAILED,
     },
     config::ServerConfig,
+    decoy::{DecoyHeaders, is_rewritten_or_dropped},
     frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     metrics::Metrics,
     policy::PolicyChecker,
@@ -87,6 +88,10 @@ struct ServerState {
     metrics: Arc<Metrics>,
     rate_limiter: Arc<AuthRateLimiter>,
     decoy_html: Arc<Vec<u8>>,
+    /// M8.4.1: optional snapshotted response headers from the cover
+    /// host. When `None`, the H3 decoy falls back to a hardcoded
+    /// minimal nginx-style header set (M3.4 original behavior).
+    decoy_headers: Option<Arc<DecoyHeaders>>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -137,6 +142,16 @@ impl Server {
             None => Arc::new(DEFAULT_DECOY_HTML.to_vec()),
         };
 
+        // M8.4.1: optionally load snapshotted response headers from
+        // the cover host. When absent the H3 decoy uses the hardcoded
+        // nginx-style header set in `serve_h3_decoy_with_default_headers`.
+        let decoy_headers: Option<Arc<DecoyHeaders>> = cfg
+            .decoy
+            .as_ref()
+            .and_then(|d| d.static_headers.as_ref())
+            .map(|p| DecoyHeaders::from_json_file(p).map(Arc::new))
+            .transpose()?;
+
         Ok(Self {
             endpoint,
             local_addr,
@@ -148,6 +163,7 @@ impl Server {
                 metrics,
                 rate_limiter,
                 decoy_html,
+                decoy_headers,
             },
         })
     }
@@ -192,6 +208,19 @@ impl Server {
     /// Decoy body length in bytes.
     pub fn decoy_body_len(&self) -> usize {
         self.state.decoy_html.len()
+    }
+
+    /// True if the operator pointed `decoy.static_headers` at a JSON
+    /// snapshot (M8.4.1). False = serve the hardcoded nginx-style
+    /// header set.
+    pub fn decoy_headers_mirrored(&self) -> bool {
+        self.state.decoy_headers.is_some()
+    }
+
+    /// Number of headers in the snapshot, if loaded. None = default
+    /// hardcoded set.
+    pub fn decoy_headers_count(&self) -> Option<usize> {
+        self.state.decoy_headers.as_ref().map(|h| h.headers.len())
     }
 
     /// Reference to the underlying Quinn endpoint. Tests can use this
@@ -285,7 +314,9 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
     // touching the auth path.
     if negotiated_alpn(&conn).as_deref() == Some(H3_ALPN) {
         println!("accepted {peer}: h3 decoy");
-        if let Err(e) = serve_h3_decoy(conn, state.decoy_html.clone()).await {
+        if let Err(e) =
+            serve_h3_decoy(conn, state.decoy_html.clone(), state.decoy_headers.clone()).await
+        {
             eprintln!("h3 decoy {peer}: {e:#}");
         }
         return Ok(());
@@ -708,13 +739,24 @@ Commercial support is available at\n\
 </body>\n\
 </html>\n";
 
-/// M13 + M3.4 decoy — serve a static 200 OK to any H3 request on this
-/// QUIC connection, using the operator-supplied HTML body (or the
-/// embedded nginx welcome default). Headers (`server`, `accept-ranges`,
-/// `content-type`) mirror a default nginx install so a passive prober
-/// sees a coherent fake cover host. Shares the server cert with the
-/// PROTEUS path. Spec v0.2 §11.
-async fn serve_h3_decoy(conn: quinn::Connection, body: Arc<Vec<u8>>) -> Result<()> {
+/// M13 + M3.4 + M8.4.1 decoy — serve a static response to any H3
+/// request on this QUIC connection.
+///
+/// Headers: if the operator pointed `decoy.static_headers` at a JSON
+/// snapshot (M8.4.1), we echo those headers verbatim *except* for a
+/// short blocklist of hop-by-hop / always-changing names (see
+/// `proteus_core::decoy::REWRITTEN_OR_DROPPED_HEADERS`). `date:` is
+/// regenerated fresh per response so the prober never sees a
+/// six-month-old timestamp. `content-length:` is set automatically
+/// by the h3 send_data path. Without a snapshot, we fall back to the
+/// hardcoded minimal nginx-style header set (M3.4 original).
+///
+/// Shares the server cert with the PROTEUS path. Spec v0.2 §11.
+async fn serve_h3_decoy(
+    conn: quinn::Connection,
+    body: Arc<Vec<u8>>,
+    headers: Option<Arc<DecoyHeaders>>,
+) -> Result<()> {
     let h3_q = h3_quinn::Connection::new(conn);
     let mut h3_conn: h3::server::Connection<_, bytes::Bytes> =
         h3::server::Connection::new(h3_q).await?;
@@ -729,12 +771,7 @@ async fn serve_h3_decoy(conn: quinn::Connection, body: Arc<Vec<u8>>) -> Result<(
                         continue;
                     }
                 };
-                let resp = http::Response::builder()
-                    .status(200)
-                    .header("server", "nginx/1.27.0")
-                    .header("content-type", "text/html; charset=utf-8")
-                    .header("accept-ranges", "bytes")
-                    .body(())?;
+                let resp = build_decoy_response(headers.as_deref())?;
                 stream.send_response(resp).await?;
                 stream
                     .send_data(bytes::Bytes::copy_from_slice(&body))
@@ -749,4 +786,188 @@ async fn serve_h3_decoy(conn: quinn::Connection, body: Arc<Vec<u8>>) -> Result<(
         }
     }
     Ok(())
+}
+
+/// Build the `http::Response<()>` for the H3 decoy, with the right
+/// headers depending on whether the operator supplied a snapshot.
+fn build_decoy_response(headers: Option<&DecoyHeaders>) -> Result<http::Response<()>> {
+    match headers {
+        None => {
+            // M3.4 default: minimal nginx-style header set.
+            let resp = http::Response::builder()
+                .status(200)
+                .header("server", "nginx/1.27.0")
+                .header("content-type", "text/html; charset=utf-8")
+                .header("accept-ranges", "bytes")
+                .header("date", httpdate_now())
+                .body(())?;
+            Ok(resp)
+        }
+        Some(snap) => {
+            // M8.4.1: cover-host-mirrored headers. Echo verbatim
+            // except for hop-by-hop / always-changing names, then
+            // add a fresh `date:` last.
+            let mut builder = http::Response::builder().status(snap.status);
+            for (name, value) in &snap.headers {
+                if is_rewritten_or_dropped(name) {
+                    continue;
+                }
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+            // Always supply a current `date:` — snapshot's would be
+            // stale and screams "static decoy".
+            builder = builder.header("date", httpdate_now());
+            Ok(builder.body(())?)
+        }
+    }
+}
+
+/// Format the current UTC time as an HTTP `Date:` header per RFC
+/// 7231 §7.1.1.1 (IMF-fixdate). Implemented inline to avoid pulling
+/// the `httpdate` crate just for one helper.
+fn httpdate_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Days/months as per IMF-fixdate.
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Convert epoch seconds → (year, month, day, hour, min, sec, weekday).
+    // Algorithm: Howard Hinnant's days-from-civil, plus Zeller-style
+    // weekday from the unix epoch (1970-01-01 was a Thursday).
+    let days_since_epoch = (secs / 86_400) as i64;
+    let time_of_day = secs % 86_400;
+    let hour = (time_of_day / 3600) as u32;
+    let minute = ((time_of_day % 3600) / 60) as u32;
+    let second = (time_of_day % 60) as u32;
+
+    // Hinnant civil_from_days, modified for unix epoch.
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y } as u32;
+
+    // Weekday: 1970-01-01 is Thursday = index 4 in our DAYS array.
+    let weekday_idx = ((days_since_epoch % 7 + 4 + 7) % 7) as usize;
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        DAYS[weekday_idx],
+        d,
+        MONTHS[(m - 1) as usize],
+        year,
+        hour,
+        minute,
+        second
+    )
+}
+
+#[cfg(test)]
+mod decoy_tests {
+    use super::*;
+
+    #[test]
+    fn httpdate_now_has_imf_fixdate_shape() {
+        let s = httpdate_now();
+        // "Day, dd Mon yyyy hh:mm:ss GMT" = 29 chars.
+        assert_eq!(s.len(), 29, "got: {s:?}");
+        assert!(s.ends_with(" GMT"), "got: {s:?}");
+        assert_eq!(&s[3..5], ", ", "got: {s:?}");
+        // Spot-check it's a known weekday.
+        let day = &s[..3];
+        assert!(
+            ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].contains(&day),
+            "got: {s:?}"
+        );
+    }
+
+    #[test]
+    fn build_decoy_response_default_headers() {
+        let resp = build_decoy_response(None).unwrap();
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers();
+        assert_eq!(h.get("server").unwrap(), "nginx/1.27.0");
+        assert_eq!(h.get("content-type").unwrap(), "text/html; charset=utf-8");
+        assert_eq!(h.get("accept-ranges").unwrap(), "bytes");
+        assert!(h.contains_key("date"));
+    }
+
+    #[test]
+    fn build_decoy_response_mirrored_headers_pass_through() {
+        let snap = DecoyHeaders::from_iter(
+            200,
+            vec![
+                ("server", "cloudflare"),
+                ("cache-control", "public, max-age=10"),
+                ("strict-transport-security", "max-age=31536000"),
+                ("content-security-policy", "default-src 'self'"),
+            ],
+        );
+        let resp = build_decoy_response(Some(&snap)).unwrap();
+        let h = resp.headers();
+        assert_eq!(h.get("server").unwrap(), "cloudflare");
+        assert_eq!(h.get("cache-control").unwrap(), "public, max-age=10");
+        assert_eq!(
+            h.get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        assert_eq!(
+            h.get("content-security-policy").unwrap(),
+            "default-src 'self'"
+        );
+        // date is always regenerated.
+        assert!(h.contains_key("date"));
+    }
+
+    #[test]
+    fn build_decoy_response_drops_hop_by_hop_and_stale_date() {
+        // Snapshot contains content-length (would lie), date (stale),
+        // transfer-encoding (hop-by-hop) — none should survive.
+        let snap = DecoyHeaders::from_iter(
+            200,
+            vec![
+                ("server", "cloudflare"),
+                ("date", "Mon, 01 Jan 2020 00:00:00 GMT"),
+                ("content-length", "999999"),
+                ("transfer-encoding", "chunked"),
+                ("connection", "keep-alive"),
+            ],
+        );
+        let resp = build_decoy_response(Some(&snap)).unwrap();
+        let h = resp.headers();
+
+        // server passes through
+        assert_eq!(h.get("server").unwrap(), "cloudflare");
+        // content-length not present (h3 sets it from send_data)
+        assert!(!h.contains_key("content-length"));
+        // transfer-encoding dropped
+        assert!(!h.contains_key("transfer-encoding"));
+        // connection dropped
+        assert!(!h.contains_key("connection"));
+        // date present but NOT the stale 2020 value
+        let date = h.get("date").unwrap().to_str().unwrap();
+        assert!(!date.contains("2020"), "date should be regenerated: {date}");
+        assert!(date.ends_with(" GMT"));
+    }
+
+    #[test]
+    fn build_decoy_response_uses_snapshot_status() {
+        let snap = DecoyHeaders::from_iter(301, vec![("location", "https://other/")]);
+        let resp = build_decoy_response(Some(&snap)).unwrap();
+        assert_eq!(resp.status(), 301);
+        assert_eq!(resp.headers().get("location").unwrap(), "https://other/");
+    }
 }

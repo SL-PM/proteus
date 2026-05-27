@@ -168,33 +168,65 @@ proteus-tools udp-test --config /tmp/client.yaml \
 
 ---
 
-## High-fidelity decoy (v0.4 M3.4 + M8.4)
+## High-fidelity decoy (v0.4 M3.4 + M8.4 + M8.4.1)
 
-The server's H3 decoy serves a static HTML body to any QUIC client that
-negotiates `h3` instead of `proteus/0.3`. By default that body is an
-embedded nginx welcome page (≈ 580 B) — plausible, but trivially
-distinguishable from the index page of any real cover host. M8.4 ships
-an operator-facing utility to close that gap:
+The server's H3 decoy serves a static response to any QUIC client that
+negotiates `h3` instead of `proteus/0.3`. By default that response is
+an embedded nginx welcome page (≈ 580 B) plus three hardcoded nginx-style
+headers — plausible, but trivially distinguishable from any real cover
+host. M8.4 + M8.4.1 ship an operator utility to close that gap:
 
 ```sh
-# Snapshot the cover host once at deploy time.
+# Snapshot the cover host's body + response headers in one go.
 proteus-tools fetch-decoy \
-    --url https://www.cloudflare.com/ \
-    --out  /etc/proteus/decoy.html
+    --url           https://www.cloudflare.com/ \
+    --out           /etc/proteus/decoy.html \
+    --out-headers   /etc/proteus/decoy-headers.json
 
-# Then reference it from the server config.
+# Then reference both from the server config.
 cat >> /etc/proteus/server.yaml <<EOF
 decoy:
-  static_page: /etc/proteus/decoy.html
+  static_page:    /etc/proteus/decoy.html
+  static_headers: /etc/proteus/decoy-headers.json
 EOF
 ```
 
-The result: an H3 probe against the PROTEUS server now sees the
-byte-identical HTML body it would see if it had `curl`'d the cover host
-directly. Headers (`server: nginx/...`, `content-type`, `accept-ranges`)
-are already handled by the M3.4 decoy code path; M8.4 only changes the
-body.
+Startup banner confirms both are loaded:
 
-Snapshots are one-shot — the operator re-runs the command when they
-want to refresh. v0.5 may add periodic re-fetch; v0.4 keeps the
-server's responsibilities minimal.
+```
+decoy body:   file (1376452 bytes)
+decoy hdrs:   mirrored from snapshot (27 headers)
+```
+
+**Result:** an H3 probe against the PROTEUS server sees a byte-identical
+HTML body AND a near-identical header set to what `curl`-against the
+real cover host would return.
+
+**Headers the server REWRITES at serve time** (regardless of snapshot):
+
+| Header | Why |
+|---|---|
+| `date` | Snapshot's `date` would be stale; server regenerates per response |
+| `content-length` | Must match the body the server actually sends |
+| `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer` | Hop-by-hop (RFC 7230 §6.1); meaningless on H2/H3 |
+| `proxy-authenticate`, `proxy-authorization` | Hop-by-hop |
+
+Everything else (server, cache-control, hsts, csp, link, alt-svc, cf-*, x-*,
+set-cookie, etc.) passes through verbatim.
+
+**Residual divergences (known v0.5+ work):** some headers in the snapshot
+are per-request-unique on the real cover host (e.g. cloudflare's
+`cf-ray`, `__cf_bm` cookie value). Echoing the static snapshot is still
+*more* coherent than the previous 3-header default, but a prober who
+makes two requests can see PROTEUS returns the same `cf-ray` twice. The
+right fix is live decoy-proxying (Approach B in
+[`PROTEUS-v0.4-plan.md`](PROTEUS-v0.4-plan.md) §6), which is out of
+scope for v0.4.
+
+Snapshots are one-shot — operators re-run `fetch-decoy` when they want
+to refresh. Both files are independent: re-snapshotting just the body
+without re-snapshotting headers (or vice-versa) is fine.
+
+`static_headers:` is optional. When absent, the server falls back to
+the M3.4 default: three nginx-style headers (`server`,
+`content-type`, `accept-ranges`) plus a fresh `date`.

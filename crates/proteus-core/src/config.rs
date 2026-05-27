@@ -60,6 +60,12 @@ pub struct PolicyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DecoyConfig {
     pub static_page: PathBuf,
+    /// M8.4.1: optional JSON snapshot of the cover host's response
+    /// headers (produced by `proteus-tools fetch-decoy --out-headers`).
+    /// When absent, the server falls back to a hardcoded minimal
+    /// nginx-style header set (M3.4 original behavior).
+    #[serde(default)]
+    pub static_headers: Option<PathBuf>,
 }
 
 impl ServerConfig {

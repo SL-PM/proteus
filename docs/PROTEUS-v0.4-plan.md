@@ -352,6 +352,7 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | M6.4 | 0-RTT resumption + replay-safety analysis ⚠️ config-only; integration test → M9.4. See [`m6.4-zero-rtt.md`](m6.4-zero-rtt.md) | C | medium |
 | M7.4 | Connection migration (mostly Quinn) ✅ — see [`m7.4-connection-migration.md`](m7.4-connection-migration.md) | C | small |
 | M8.4 | Operator-facing fetch-decoy utility (`proteus-tools fetch-decoy`) ✅ | C | small |
+| M8.4.1 | Decoy response-header mirroring (snapshot + serve) ✅ | C | small |
 | M9.4 | v0.4-rc.1 sign-off: server-as-library refactor + integration tests + decoy comparison ✅ — see [`m9.4-rc1-signoff.md`](m9.4-rc1-signoff.md) | C | medium |
 | M10.4 | (stretch) Approach B: own real cert for proxy host | B | large |
 | M11.4 | (stretch) Approach A: REALITY-style upstream relay | A | very large |

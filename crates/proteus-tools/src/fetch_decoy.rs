@@ -36,6 +36,7 @@ use std::{io::Write, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args as ClapArgs;
+use proteus_core::decoy::DecoyHeaders;
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 
 /// Default User-Agent. Mirrors a stock Firefox-on-macOS UA at
@@ -59,6 +60,13 @@ pub struct Args {
     #[arg(short, long)]
     pub out: Option<PathBuf>,
 
+    /// File to write the response headers to as JSON (M8.4.1). Loaded
+    /// by `proteus-server` via `decoy.static_headers` so the H3 decoy
+    /// can echo the cover host's exact header set. Omitted = no
+    /// header snapshot file is written.
+    #[arg(long)]
+    pub out_headers: Option<PathBuf>,
+
     /// User-Agent header. Defaults to a stock Firefox UA.
     #[arg(long)]
     pub user_agent: Option<String>,
@@ -80,7 +88,21 @@ pub struct Args {
 pub struct Fetched {
     pub status: u16,
     pub content_type: Option<String>,
+    /// All response headers in wire order, lowercased names. Empty
+    /// for non-2xx errors that didn't even parse a header section
+    /// (reqwest still gives us them, so realistically always populated).
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl Fetched {
+    /// Project into the on-disk [`DecoyHeaders`] snapshot format.
+    pub fn to_decoy_headers(&self) -> DecoyHeaders {
+        DecoyHeaders {
+            status: self.status,
+            headers: self.headers.clone(),
+        }
+    }
 }
 
 pub async fn run(args: Args) -> Result<()> {
@@ -110,6 +132,19 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     write_body(args.out.as_deref(), &fetched.body)?;
+
+    if let Some(headers_path) = args.out_headers.as_deref() {
+        let snapshot = fetched.to_decoy_headers();
+        let json = snapshot.to_json_pretty()?;
+        std::fs::write(headers_path, json)
+            .with_context(|| format!("write {}", headers_path.display()))?;
+        eprintln!(
+            "wrote headers snapshot: {} ({} headers)",
+            headers_path.display(),
+            snapshot.headers.len()
+        );
+    }
+
     Ok(())
 }
 
@@ -143,11 +178,26 @@ async fn fetch(url: &str, user_agent: &str, timeout: Duration) -> Result<Fetched
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
+    // Snapshot ALL response headers in wire order. Names are lowercased
+    // (matches H2/H3 wire format anyway); values pass through verbatim
+    // including duplicates (e.g. multiple `set-cookie`).
+    let headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
+
     let body = resp.bytes().await.context("read response body")?.to_vec();
 
     Ok(Fetched {
         status,
         content_type,
+        headers,
         body,
     })
 }
@@ -261,6 +311,7 @@ mod tests {
         run(Args {
             url: format!("http://{addr}/"),
             out: Some(out.clone()),
+            out_headers: None,
             user_agent: None,
             timeout_secs: 2,
             accept_non_2xx: false,
@@ -281,6 +332,7 @@ mod tests {
         let err = run(Args {
             url: format!("http://{addr}/"),
             out: Some(out.clone()),
+            out_headers: None,
             user_agent: None,
             timeout_secs: 2,
             accept_non_2xx: false,
@@ -302,6 +354,7 @@ mod tests {
         run(Args {
             url: format!("http://{addr}/"),
             out: Some(out.clone()),
+            out_headers: None,
             user_agent: None,
             timeout_secs: 2,
             accept_non_2xx: true,
@@ -309,6 +362,75 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"nope");
+    }
+
+    #[tokio::test]
+    async fn fetch_captures_full_header_list_in_order() {
+        let body = b"x";
+        let resp = http_response(
+            "200 OK",
+            &[
+                ("Server", "nginx/1.27.0"),
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Cache-Control", "public, max-age=60"),
+                ("Strict-Transport-Security", "max-age=31536000"),
+            ],
+            body,
+        );
+        let addr = spawn_fixed_response(resp).await;
+        let url = format!("http://{addr}/");
+
+        let got = fetch(&url, DEFAULT_USER_AGENT, Duration::from_secs(2))
+            .await
+            .unwrap();
+        // All names lowercased; cover-host headers preserved.
+        let names: Vec<&str> = got.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"server"));
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"cache-control"));
+        assert!(names.contains(&"strict-transport-security"));
+        let server_val = got
+            .headers
+            .iter()
+            .find(|(n, _)| n == "server")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(server_val, Some("nginx/1.27.0"));
+    }
+
+    #[tokio::test]
+    async fn run_writes_headers_snapshot_alongside_body() {
+        let body = b"<html>x</html>";
+        let resp = http_response(
+            "200 OK",
+            &[
+                ("Server", "nginx/1.27.0"),
+                ("Content-Type", "text/html; charset=utf-8"),
+            ],
+            body,
+        );
+        let addr = spawn_fixed_response(resp).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let body_path = dir.path().join("decoy.html");
+        let headers_path = dir.path().join("decoy-headers.json");
+        run(Args {
+            url: format!("http://{addr}/"),
+            out: Some(body_path.clone()),
+            out_headers: Some(headers_path.clone()),
+            user_agent: None,
+            timeout_secs: 2,
+            accept_non_2xx: false,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(&body_path).unwrap(), body);
+
+        let loaded = DecoyHeaders::from_json_file(&headers_path).unwrap();
+        assert_eq!(loaded.status, 200);
+        let names: Vec<&str> = loaded.headers.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"server"));
+        assert!(names.contains(&"content-type"));
     }
 
     #[tokio::test]

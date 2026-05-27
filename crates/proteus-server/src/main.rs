@@ -55,13 +55,20 @@ async fn main() -> Result<()> {
         RATE_LIMIT_WINDOW.as_secs()
     );
     println!(
-        "decoy:        {} ({} bytes)",
+        "decoy body:   {} ({} bytes)",
         if server.decoy_is_file_backed(&cfg) {
             "file"
         } else {
             "embedded default (nginx welcome)"
         },
         server.decoy_body_len()
+    );
+    println!(
+        "decoy hdrs:   {}",
+        match server.decoy_headers_count() {
+            Some(n) => format!("mirrored from snapshot ({n} headers)"),
+            None => "hardcoded nginx-style (3 headers + fresh Date)".to_string(),
+        }
     );
     if server.clients_len() == 0 {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");

@@ -5,6 +5,7 @@
 pub mod aead;
 pub mod auth;
 pub mod config;
+pub mod decoy;
 pub mod frame;
 pub mod metrics;
 pub mod policy;
