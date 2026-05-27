@@ -28,6 +28,17 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+/// Default transport config for both server and client. Caps the QUIC
+/// idle timeout at 30 seconds so a stalled connection cannot hold a
+/// server slot forever (M18 hardening — slow-loris bound).
+pub fn default_transport_config() -> quinn::TransportConfig {
+    let mut tc = quinn::TransportConfig::default();
+    tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
+        30_000,
+    ))));
+    tc
+}
+
 /// Build a Quinn server config. Returns the chosen leaf cert too, so the
 /// caller can print its SHA-256 for clients to pin.
 pub fn server_config(
@@ -46,9 +57,10 @@ pub fn server_config(
         .with_single_cert(vec![cert_der.clone()], key_der)?;
     rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
 
-    let qcfg = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut qcfg = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg)?,
     ));
+    qcfg.transport_config(Arc::new(default_transport_config()));
     Ok((qcfg, cert_der))
 }
 
@@ -74,9 +86,11 @@ pub fn client_config(pin_sha256_hex: &str) -> Result<quinn::ClientConfig> {
         .with_no_client_auth();
     rustls_cfg.alpn_protocols = vec![ALPN.to_vec()];
 
-    Ok(quinn::ClientConfig::new(Arc::new(
+    let mut ccfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)?,
-    )))
+    ));
+    ccfg.transport_config(Arc::new(default_transport_config()));
+    Ok(ccfg)
 }
 
 /// Lowercase hex SHA-256 of a certificate DER. For logging and pinning.

@@ -43,6 +43,10 @@ use tokio::net::{TcpStream, UdpSocket};
 /// `H3_GENERAL_PROTOCOL_ERROR` per spec v0.2 §8.4.
 const AUTH_FAIL_CLOSE_CODE: u32 = 0x0101;
 
+/// Max time to wait for the first AUTH_REQUEST frame after the
+/// control stream is accepted. Slow-loris hardening (M18).
+const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Per spec v0.2 §8.3.
 const REPLAY_TTL: Duration = Duration::from_secs(300);
 
@@ -165,9 +169,18 @@ async fn handle_conn(
 
     // ----- auth on the control stream -----
     let (mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await.context("accept_bi ctrl")?;
-    let auth_frame = read_frame(&mut ctrl_recv)
-        .await
-        .context("read AUTH_REQUEST frame")?;
+    let auth_frame = match tokio::time::timeout(AUTH_READ_TIMEOUT, read_frame(&mut ctrl_recv)).await
+    {
+        Ok(r) => r.context("read AUTH_REQUEST frame")?,
+        Err(_) => {
+            eprintln!(
+                "{peer}: AUTH_REQUEST not received within {}s; closing",
+                AUTH_READ_TIMEOUT.as_secs()
+            );
+            conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
+            return Ok(());
+        }
+    };
     if auth_frame.frame_type != FrameType::AuthRequest {
         eprintln!(
             "{peer}: expected AuthRequest, got {:?}",
