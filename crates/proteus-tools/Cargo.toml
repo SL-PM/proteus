@@ -16,6 +16,17 @@ proteus-core = { path = "../proteus-core" }
 quinn = "0.11"
 rand = "0.8"
 rcgen = "0.13"
+# M8.4 fetch-decoy: HTTPS GET against a cover host. rustls-tls keeps the
+# crypto stack consistent with the rest of the workspace; default-features
+# off drops the openssl/native-tls path. http2/gzip/deflate/brotli match
+# what a stock browser would offer so the request fingerprint blends in.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "gzip",
+    "deflate",
+    "brotli",
+] }
 rustls = "0.23"
 tokio = { version = "1", features = ["full"] }
 

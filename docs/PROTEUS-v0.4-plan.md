@@ -351,7 +351,7 @@ Numbered M0.4-style to avoid clashing with v0.3's M0-M19.
 | M5.4.1 | Wire-format AEAD wrapping: all proxy-stream frames go through `read_frame_aead` / `write_frame_aead`; AAD binds `(frame_type, flags, stream_id)`; TCP+UDP smoke pass ✅ | C | medium |
 | M6.4 | 0-RTT resumption + replay-safety analysis ⚠️ config-only; integration test → M9.4. See [`m6.4-zero-rtt.md`](m6.4-zero-rtt.md) | C | medium |
 | M7.4 | Connection migration (mostly Quinn) ✅ — see [`m7.4-connection-migration.md`](m7.4-connection-migration.md) | C | small |
-| M8.4 | Operator-facing fetch-decoy-on-startup utility | C | small |
+| M8.4 | Operator-facing fetch-decoy utility (`proteus-tools fetch-decoy`) ✅ | C | small |
 | M9.4 | v0.4-rc.1 sign-off: capture + comparison vs cover host | C | medium |
 | M10.4 | (stretch) Approach B: own real cert for proxy host | B | large |
 | M11.4 | (stretch) Approach A: REALITY-style upstream relay | A | very large |

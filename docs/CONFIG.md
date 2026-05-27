@@ -165,3 +165,36 @@ For UDP, use the `proteus-tools udp-test` subcommand instead of SOCKS5
 proteus-tools udp-test --config /tmp/client.yaml \
     --target 127.0.0.1:9998 --payload "hello-udp"
 ```
+
+---
+
+## High-fidelity decoy (v0.4 M3.4 + M8.4)
+
+The server's H3 decoy serves a static HTML body to any QUIC client that
+negotiates `h3` instead of `proteus/0.3`. By default that body is an
+embedded nginx welcome page (≈ 580 B) — plausible, but trivially
+distinguishable from the index page of any real cover host. M8.4 ships
+an operator-facing utility to close that gap:
+
+```sh
+# Snapshot the cover host once at deploy time.
+proteus-tools fetch-decoy \
+    --url https://www.cloudflare.com/ \
+    --out  /etc/proteus/decoy.html
+
+# Then reference it from the server config.
+cat >> /etc/proteus/server.yaml <<EOF
+decoy:
+  static_page: /etc/proteus/decoy.html
+EOF
+```
+
+The result: an H3 probe against the PROTEUS server now sees the
+byte-identical HTML body it would see if it had `curl`'d the cover host
+directly. Headers (`server: nginx/...`, `content-type`, `accept-ranges`)
+are already handled by the M3.4 decoy code path; M8.4 only changes the
+body.
+
+Snapshots are one-shot — the operator re-runs the command when they
+want to refresh. v0.5 may add periodic re-fetch; v0.4 keeps the
+server's responsibilities minimal.
