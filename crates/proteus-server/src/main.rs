@@ -1,18 +1,23 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M10: auth + replay cache + per-target proxy streams for both TCP and
-//! UDP (spec v0.2 §9). For each connection:
+//! M12: auth + replay cache + per-target proxy streams for TCP and UDP,
+//! plus a server-side policy engine that vets each target before connect.
+//! For each connection:
 //!   1. accept control stream, run auth + replay check
 //!   2. on success: AUTH_RESPONSE(ok), then loop `accept_bi()` for
 //!      additional bidi streams. Each is treated as a proxy stream:
-//!      read PROXY_OPEN, dispatch on `cmd` to either the TCP or UDP
-//!      bridge in [`proteus_core::proxy`], or PROXY_REJECT with the
-//!      appropriate reason code.
+//!      read PROXY_OPEN, resolve the target host, run the policy check,
+//!      then either bridge to TCP/UDP or PROXY_REJECT with a code.
 //!   3. on auth failure: `H3_GENERAL_PROTOCOL_ERROR` close (no plaintext)
 //!
-//! Policy (M12) and decoy (M13) still missing.
+//! Decoy (M13) is the last v0.3 protocol piece still missing.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
@@ -23,6 +28,7 @@ use proteus_core::{
     },
     config::ServerConfig,
     frame::{Frame, FrameType, read_frame, write_frame},
+    policy::PolicyChecker,
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
     replay::ReplayCache,
     tls,
@@ -65,25 +71,38 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(ClientRegistry::from_config_map(cfg.clients.as_ref())?);
     let replay = Arc::new(ReplayCache::new(REPLAY_TTL));
+    let policy: Option<Arc<PolicyChecker>> = cfg
+        .policy
+        .as_ref()
+        .map(|p| Arc::new(PolicyChecker::from_config(p)));
 
     println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
     println!("listening on: {}", endpoint.local_addr()?);
     println!("cert sha256:  {}", tls::cert_sha256_hex(&cert));
     println!("clients:      {}", registry.len());
     println!("replay ttl:   {}s", REPLAY_TTL.as_secs());
+    println!(
+        "policy:       {}",
+        if policy.is_some() {
+            "enabled"
+        } else {
+            "disabled (no `policy:` section in config)"
+        }
+    );
     if registry.is_empty() {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
     println!();
-    println!("auth + replay cache + TCP/UDP proxy. Ctrl-C to stop.");
+    println!("auth + replay cache + policy + TCP/UDP proxy. Ctrl-C to stop.");
 
     spawn_replay_sweeper(replay.clone());
 
     while let Some(incoming) = endpoint.accept().await {
         let registry = registry.clone();
         let replay = replay.clone();
+        let policy = policy.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(incoming, registry, replay).await {
+            if let Err(e) = handle_conn(incoming, registry, replay, policy).await {
                 eprintln!("conn error: {e:#}");
             }
         });
@@ -112,6 +131,7 @@ async fn handle_conn(
     incoming: quinn::Incoming,
     registry: Arc<ClientRegistry>,
     replay: Arc<ReplayCache>,
+    policy: Option<Arc<PolicyChecker>>,
 ) -> Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = conn.remote_address();
@@ -168,8 +188,9 @@ async fn handle_conn(
     let peer_label = format!("{peer}/{client_id}");
     while let Ok((q_send, q_recv)) = conn.accept_bi().await {
         let label = peer_label.clone();
+        let policy = policy.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_proxy_stream(q_send, q_recv).await {
+            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy).await {
                 eprintln!("proxy {label}: {e:#}");
             }
         });
@@ -190,6 +211,7 @@ async fn reject_auth(ctrl_send: &mut quinn::SendStream, conn: &quinn::Connection
 async fn handle_proxy_stream(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
+    policy: Option<Arc<PolicyChecker>>,
 ) -> Result<()> {
     let open_frame = read_frame(&mut q_recv).await.context("read PROXY_OPEN")?;
     if open_frame.frame_type != FrameType::ProxyOpen {
@@ -204,10 +226,9 @@ async fn handle_proxy_stream(
         }
     };
 
-    let target = format!("{}:{}", open.host, open.port);
     match open.cmd.as_str() {
-        "tcp" => proxy_to_tcp(q_send, q_recv, target).await,
-        "udp" => proxy_to_udp(q_send, q_recv, target).await,
+        "tcp" => proxy_to_tcp(q_send, q_recv, open.host, open.port, policy.as_deref()).await,
+        "udp" => proxy_to_udp(q_send, q_recv, open.host, open.port, policy.as_deref()).await,
         other => {
             let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
             bail!("unsupported cmd {other:?}");
@@ -223,19 +244,51 @@ async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> 
     Ok(())
 }
 
+/// Resolve a `host:port` string via tokio. Returns the full list of
+/// `SocketAddr` so the caller can both run policy on every IP and pick
+/// one to actually connect to.
+async fn resolve_target(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("resolve {host}:{port}"))?
+        .collect();
+    if addrs.is_empty() {
+        bail!("{host}:{port} resolved to no addresses");
+    }
+    Ok(addrs)
+}
+
 async fn proxy_to_tcp(
     mut q_send: quinn::SendStream,
     q_recv: quinn::RecvStream,
-    target: String,
+    host: String,
+    port: u16,
+    policy: Option<&PolicyChecker>,
 ) -> Result<()> {
-    let tcp = match TcpStream::connect(&target).await {
+    let resolved = match resolve_target(&host, port).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            return Err(e);
+        }
+    };
+
+    if let Some(p) = policy {
+        let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
+        if let Err(e) = p.check_tcp(port, &ips) {
+            let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
+            bail!("policy denied tcp {host}:{port}: {e}");
+        }
+    }
+
+    let tcp = match TcpStream::connect(&resolved[0]).await {
         Ok(s) => s,
         Err(e) => {
             let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
-            bail!("tcp connect {target}: {e}");
+            bail!("tcp connect {host}:{port} ({}): {e}", resolved[0]);
         }
     };
-    println!("  proxy → tcp {target}");
+    println!("  proxy → tcp {host}:{port} ({})", resolved[0]);
 
     let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
     write_frame(&mut q_send, &accept)
@@ -249,8 +302,26 @@ async fn proxy_to_tcp(
 async fn proxy_to_udp(
     mut q_send: quinn::SendStream,
     q_recv: quinn::RecvStream,
-    target: String,
+    host: String,
+    port: u16,
+    policy: Option<&PolicyChecker>,
 ) -> Result<()> {
+    let resolved = match resolve_target(&host, port).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            return Err(e);
+        }
+    };
+
+    if let Some(p) = policy {
+        let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
+        if let Err(e) = p.check_udp(port, &ips) {
+            let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
+            bail!("policy denied udp {host}:{port}: {e}");
+        }
+    }
+
     let udp = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
@@ -258,11 +329,11 @@ async fn proxy_to_udp(
             bail!("udp bind: {e}");
         }
     };
-    if let Err(e) = udp.connect(&target).await {
+    if let Err(e) = udp.connect(&resolved[0]).await {
         let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
-        bail!("udp connect {target}: {e}");
+        bail!("udp connect {host}:{port} ({}): {e}", resolved[0]);
     }
-    println!("  proxy → udp {target}");
+    println!("  proxy → udp {host}:{port} ({})", resolved[0]);
 
     let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
     write_frame(&mut q_send, &accept)
