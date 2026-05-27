@@ -172,6 +172,76 @@ where
     Ok(())
 }
 
+/// Bidirectional bridge between a Quinn (send, recv) pair and a connected
+/// `tokio::net::UdpSocket`. One PROTEUS DATA frame per UDP datagram in
+/// both directions. v0.3 picks this over QUIC DATAGRAM extension for
+/// simplicity — head-of-line blocking inside the stream is accepted.
+///
+/// Termination: UDP has no natural EOF on the recv side, so the bridge
+/// terminates when the QUIC side signals EOF (client called
+/// `SendStream::finish()`). After that, the UDP→QUIC direction gets a
+/// short grace window (500 ms) to drain any in-flight responses before
+/// it is dropped.
+pub async fn bridge_quic_udp(
+    mut q_send: quinn::SendStream,
+    mut q_recv: quinn::RecvStream,
+    udp: tokio::net::UdpSocket,
+) -> anyhow::Result<()> {
+    use std::{sync::Arc, time::Duration};
+
+    use crate::frame::{Frame, FrameType, read_frame, write_frame};
+
+    /// Max IPv4 UDP datagram payload (65535 - 8 UDP - 20 IP).
+    const UDP_RECV_BUF: usize = 65_507;
+    const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+    let udp = Arc::new(udp);
+    let udp_send = udp.clone();
+    let udp_recv = udp.clone();
+
+    let q2u = async move {
+        loop {
+            let f = match read_frame(&mut q_recv).await {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+            if f.frame_type != FrameType::Data {
+                break;
+            }
+            if !f.payload.is_empty() {
+                udp_send.send(&f.payload).await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    let u2q = async move {
+        let mut buf = vec![0u8; UDP_RECV_BUF];
+        loop {
+            let n = udp_recv.recv(&mut buf).await?;
+            let frame = Frame::new(FrameType::Data, Bytes::copy_from_slice(&buf[..n]))?;
+            write_frame(&mut q_send, &frame).await?;
+        }
+        // The loop above is divergent; this Ok exists so the async
+        // block's return type can be inferred as Result<(), _>.
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::pin!(q2u, u2q);
+    tokio::select! {
+        r = &mut q2u => {
+            r.context("quic→udp bridge")?;
+            // QUIC side done; drain UDP responses briefly.
+            let _ = tokio::time::timeout(DRAIN_GRACE, &mut u2q).await;
+        }
+        r = &mut u2q => {
+            r.context("udp→quic bridge")?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

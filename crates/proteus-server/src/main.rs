@@ -1,16 +1,16 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M8: auth + replay cache + per-target TCP proxy streams (spec v0.2 §9).
-//! For each connection:
+//! M10: auth + replay cache + per-target proxy streams for both TCP and
+//! UDP (spec v0.2 §9). For each connection:
 //!   1. accept control stream, run auth + replay check
 //!   2. on success: AUTH_RESPONSE(ok), then loop `accept_bi()` for
 //!      additional bidi streams. Each is treated as a proxy stream:
-//!      read PROXY_OPEN, attempt `TcpStream::connect`, then either
-//!      PROXY_ACCEPT + bridge DATA ↔ raw TCP (via
-//!      [`proteus_core::proxy::bridge_quic_tcp`]), or PROXY_REJECT(reason).
+//!      read PROXY_OPEN, dispatch on `cmd` to either the TCP or UDP
+//!      bridge in [`proteus_core::proxy`], or PROXY_REJECT with the
+//!      appropriate reason code.
 //!   3. on auth failure: `H3_GENERAL_PROTOCOL_ERROR` close (no plaintext)
 //!
-//! Policy (M12), UDP (M10), and decoy (M13) still missing.
+//! Policy (M12) and decoy (M13) still missing.
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -27,7 +27,7 @@ use proteus_core::{
     replay::ReplayCache,
     tls,
 };
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 
 /// QUIC application close code on auth failure — same family as
 /// `H3_GENERAL_PROTOCOL_ERROR` per spec v0.2 §8.4.
@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
     println!();
-    println!("auth + replay cache + TCP proxy. Ctrl-C to stop.");
+    println!("auth + replay cache + TCP/UDP proxy. Ctrl-C to stop.");
 
     spawn_replay_sweeper(replay.clone());
 
@@ -191,7 +191,6 @@ async fn handle_proxy_stream(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
 ) -> Result<()> {
-    // 1. Read PROXY_OPEN.
     let open_frame = read_frame(&mut q_recv).await.context("read PROXY_OPEN")?;
     if open_frame.frame_type != FrameType::ProxyOpen {
         let _ = reject_proxy(&mut q_send, reject_codes::PROTOCOL_ERROR).await;
@@ -205,31 +204,15 @@ async fn handle_proxy_stream(
         }
     };
 
-    if open.cmd != "tcp" {
-        let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
-        bail!("unsupported cmd {:?} (M8 = TCP only; UDP is M10)", open.cmd);
-    }
-
-    // 2. Connect to the target.
     let target = format!("{}:{}", open.host, open.port);
-    let tcp = match TcpStream::connect(&target).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
-            bail!("connect {target}: {e}");
+    match open.cmd.as_str() {
+        "tcp" => proxy_to_tcp(q_send, q_recv, target).await,
+        "udp" => proxy_to_udp(q_send, q_recv, target).await,
+        other => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
+            bail!("unsupported cmd {other:?}");
         }
-    };
-    println!("  proxy → tcp {target}");
-
-    // 3. PROXY_ACCEPT.
-    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
-    write_frame(&mut q_send, &accept)
-        .await
-        .context("write PROXY_ACCEPT")?;
-
-    // 4. Bridge.
-    let (tcp_r, tcp_w) = tcp.into_split();
-    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
+    }
 }
 
 async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> {
@@ -238,4 +221,53 @@ async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> 
         .await
         .context("write PROXY_REJECT")?;
     Ok(())
+}
+
+async fn proxy_to_tcp(
+    mut q_send: quinn::SendStream,
+    q_recv: quinn::RecvStream,
+    target: String,
+) -> Result<()> {
+    let tcp = match TcpStream::connect(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            bail!("tcp connect {target}: {e}");
+        }
+    };
+    println!("  proxy → tcp {target}");
+
+    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
+    write_frame(&mut q_send, &accept)
+        .await
+        .context("write PROXY_ACCEPT")?;
+
+    let (tcp_r, tcp_w) = tcp.into_split();
+    proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
+}
+
+async fn proxy_to_udp(
+    mut q_send: quinn::SendStream,
+    q_recv: quinn::RecvStream,
+    target: String,
+) -> Result<()> {
+    let udp = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+            bail!("udp bind: {e}");
+        }
+    };
+    if let Err(e) = udp.connect(&target).await {
+        let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
+        bail!("udp connect {target}: {e}");
+    }
+    println!("  proxy → udp {target}");
+
+    let accept = Frame::new(FrameType::ProxyAccept, Bytes::new())?;
+    write_frame(&mut q_send, &accept)
+        .await
+        .context("write PROXY_ACCEPT")?;
+
+    proxy::bridge_quic_udp(q_send, q_recv, udp).await
 }

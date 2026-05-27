@@ -808,9 +808,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bytes",
  "clap",
  "ed25519-dalek",
  "hex",
+ "proteus-core",
  "quinn",
  "rand 0.8.6",
  "rcgen",

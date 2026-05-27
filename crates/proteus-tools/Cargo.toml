@@ -7,9 +7,11 @@ default-run = "proteus-tools"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hex = "0.4"
+proteus-core = { path = "../proteus-core" }
 quinn = "0.11"
 rand = "0.8"
 rcgen = "0.13"
