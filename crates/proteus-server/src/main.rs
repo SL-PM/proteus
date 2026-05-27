@@ -1,16 +1,19 @@
 //! PROTEUS server (v0.3 research prototype).
 //!
-//! M12: auth + replay cache + per-target proxy streams for TCP and UDP,
-//! plus a server-side policy engine that vets each target before connect.
+//! M17: auth + replay cache + policy + TCP/UDP proxy, plus atomic
+//! counters for auth/replay/policy/proxy events surfaced via a
+//! periodic stderr snapshot (every 30s). Counters live in
+//! `proteus_core::metrics`.
+//!
 //! For each connection:
 //!   1. accept control stream, run auth + replay check
 //!   2. on success: AUTH_RESPONSE(ok), then loop `accept_bi()` for
 //!      additional bidi streams. Each is treated as a proxy stream:
-//!      read PROXY_OPEN, resolve the target host, run the policy check,
-//!      then either bridge to TCP/UDP or PROXY_REJECT with a code.
+//!      read PROXY_OPEN, resolve the target host, run the policy
+//!      check, then either bridge to TCP/UDP or PROXY_REJECT.
 //!   3. on auth failure: `H3_GENERAL_PROTOCOL_ERROR` close (no plaintext)
 //!
-//! Decoy (M13) is the last v0.3 protocol piece still missing.
+//! Decoy (M13) and hardening (M18) are the last v0.3 protocol pieces.
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -28,6 +31,7 @@ use proteus_core::{
     },
     config::ServerConfig,
     frame::{Frame, FrameType, read_frame, write_frame},
+    metrics::Metrics,
     policy::PolicyChecker,
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
     replay::ReplayCache,
@@ -44,6 +48,9 @@ const REPLAY_TTL: Duration = Duration::from_secs(300);
 
 /// How often to sweep expired entries from the replay cache.
 const REPLAY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the metrics snapshot is written to stderr.
+const METRICS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Parser, Debug)]
 #[command(
@@ -75,6 +82,7 @@ async fn main() -> Result<()> {
         .policy
         .as_ref()
         .map(|p| Arc::new(PolicyChecker::from_config(p)));
+    let metrics = Arc::new(Metrics::new());
 
     println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
     println!("listening on: {}", endpoint.local_addr()?);
@@ -89,20 +97,26 @@ async fn main() -> Result<()> {
             "disabled (no `policy:` section in config)"
         }
     );
+    println!(
+        "metrics:      snapshot every {}s to stderr",
+        METRICS_SNAPSHOT_INTERVAL.as_secs()
+    );
     if registry.is_empty() {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
     println!();
-    println!("auth + replay cache + policy + TCP/UDP proxy. Ctrl-C to stop.");
+    println!("auth + replay + policy + TCP/UDP proxy + metrics. Ctrl-C to stop.");
 
     spawn_replay_sweeper(replay.clone());
+    spawn_metrics_logger(metrics.clone());
 
     while let Some(incoming) = endpoint.accept().await {
         let registry = registry.clone();
         let replay = replay.clone();
         let policy = policy.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(incoming, registry, replay, policy).await {
+            if let Err(e) = handle_conn(incoming, registry, replay, policy, metrics).await {
                 eprintln!("conn error: {e:#}");
             }
         });
@@ -127,11 +141,23 @@ fn spawn_replay_sweeper(replay: Arc<ReplayCache>) {
     });
 }
 
+fn spawn_metrics_logger(metrics: Arc<Metrics>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(METRICS_SNAPSHOT_INTERVAL);
+        tick.tick().await; // skip the immediate fire
+        loop {
+            tick.tick().await;
+            eprintln!("--- metrics ---\n{}", metrics.snapshot());
+        }
+    });
+}
+
 async fn handle_conn(
     incoming: quinn::Incoming,
     registry: Arc<ClientRegistry>,
     replay: Arc<ReplayCache>,
     policy: Option<Arc<PolicyChecker>>,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = conn.remote_address();
@@ -150,10 +176,13 @@ async fn handle_conn(
         conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
         return Ok(());
     }
+    metrics.auth_attempt();
+
     let req = match AuthRequest::decode(&auth_frame.payload) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{peer}: malformed AUTH_REQUEST: {e:#}");
+            metrics.auth_failed_inc();
             conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
             return Ok(());
         }
@@ -167,6 +196,7 @@ async fn handle_conn(
         Ok(id) => id,
         Err(e) => {
             eprintln!("{peer}: auth FAIL ({}): {e:#}", req.client_id);
+            metrics.auth_failed_inc();
             reject_auth(&mut ctrl_send, &conn).await;
             return Ok(());
         }
@@ -174,6 +204,7 @@ async fn handle_conn(
 
     if let Err(e) = replay.check_and_record(&client_id, &req.nonce) {
         eprintln!("{peer}: REPLAY rejected for {client_id}: {e:#}");
+        metrics.replay_rejected_inc();
         reject_auth(&mut ctrl_send, &conn).await;
         return Ok(());
     }
@@ -182,6 +213,8 @@ async fn handle_conn(
     write_frame(&mut ctrl_send, &resp_frame)
         .await
         .context("write AUTH_RESPONSE")?;
+    metrics.auth_success_inc();
+    metrics.active_session_inc();
     println!("{peer}: auth OK as {client_id}");
 
     // ----- per-target proxy streams -----
@@ -189,12 +222,14 @@ async fn handle_conn(
     while let Ok((q_send, q_recv)) = conn.accept_bi().await {
         let label = peer_label.clone();
         let policy = policy.clone();
+        let metrics = metrics.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy).await {
+            if let Err(e) = handle_proxy_stream(q_send, q_recv, policy, metrics).await {
                 eprintln!("proxy {label}: {e:#}");
             }
         });
     }
+    metrics.active_session_dec();
     println!("{peer_label}: closed");
     Ok(())
 }
@@ -212,6 +247,7 @@ async fn handle_proxy_stream(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
     policy: Option<Arc<PolicyChecker>>,
+    metrics: Arc<Metrics>,
 ) -> Result<()> {
     let open_frame = read_frame(&mut q_recv).await.context("read PROXY_OPEN")?;
     if open_frame.frame_type != FrameType::ProxyOpen {
@@ -227,8 +263,28 @@ async fn handle_proxy_stream(
     };
 
     match open.cmd.as_str() {
-        "tcp" => proxy_to_tcp(q_send, q_recv, open.host, open.port, policy.as_deref()).await,
-        "udp" => proxy_to_udp(q_send, q_recv, open.host, open.port, policy.as_deref()).await,
+        "tcp" => {
+            proxy_to_tcp(
+                q_send,
+                q_recv,
+                open.host,
+                open.port,
+                policy.as_deref(),
+                &metrics,
+            )
+            .await
+        }
+        "udp" => {
+            proxy_to_udp(
+                q_send,
+                q_recv,
+                open.host,
+                open.port,
+                policy.as_deref(),
+                &metrics,
+            )
+            .await
+        }
         other => {
             let _ = reject_proxy(&mut q_send, reject_codes::UNSUPPORTED_CMD).await;
             bail!("unsupported cmd {other:?}");
@@ -244,9 +300,6 @@ async fn reject_proxy(q_send: &mut quinn::SendStream, reason: u8) -> Result<()> 
     Ok(())
 }
 
-/// Resolve a `host:port` string via tokio. Returns the full list of
-/// `SocketAddr` so the caller can both run policy on every IP and pick
-/// one to actually connect to.
 async fn resolve_target(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
@@ -264,10 +317,12 @@ async fn proxy_to_tcp(
     host: String,
     port: u16,
     policy: Option<&PolicyChecker>,
+    metrics: &Metrics,
 ) -> Result<()> {
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
+            metrics.proxy_upstream_unreachable_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
             return Err(e);
         }
@@ -276,6 +331,7 @@ async fn proxy_to_tcp(
     if let Some(p) = policy {
         let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
         if let Err(e) = p.check_tcp(port, &ips) {
+            metrics.policy_rejected_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
             bail!("policy denied tcp {host}:{port}: {e}");
         }
@@ -284,6 +340,7 @@ async fn proxy_to_tcp(
     let tcp = match TcpStream::connect(&resolved[0]).await {
         Ok(s) => s,
         Err(e) => {
+            metrics.proxy_upstream_unreachable_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
             bail!("tcp connect {host}:{port} ({}): {e}", resolved[0]);
         }
@@ -295,6 +352,7 @@ async fn proxy_to_tcp(
         .await
         .context("write PROXY_ACCEPT")?;
 
+    metrics.proxy_tcp_opened_inc();
     let (tcp_r, tcp_w) = tcp.into_split();
     proxy::bridge_quic_tcp(q_send, q_recv, tcp_r, tcp_w).await
 }
@@ -305,10 +363,12 @@ async fn proxy_to_udp(
     host: String,
     port: u16,
     policy: Option<&PolicyChecker>,
+    metrics: &Metrics,
 ) -> Result<()> {
     let resolved = match resolve_target(&host, port).await {
         Ok(v) => v,
         Err(e) => {
+            metrics.proxy_upstream_unreachable_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
             return Err(e);
         }
@@ -317,6 +377,7 @@ async fn proxy_to_udp(
     if let Some(p) = policy {
         let ips: Vec<IpAddr> = resolved.iter().map(|s| s.ip()).collect();
         if let Err(e) = p.check_udp(port, &ips) {
+            metrics.policy_rejected_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::POLICY_DENIED).await;
             bail!("policy denied udp {host}:{port}: {e}");
         }
@@ -325,11 +386,13 @@ async fn proxy_to_udp(
     let udp = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
+            metrics.proxy_upstream_unreachable_inc();
             let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
             bail!("udp bind: {e}");
         }
     };
     if let Err(e) = udp.connect(&resolved[0]).await {
+        metrics.proxy_upstream_unreachable_inc();
         let _ = reject_proxy(&mut q_send, reject_codes::UPSTREAM_UNREACHABLE).await;
         bail!("udp connect {host}:{port} ({}): {e}", resolved[0]);
     }
@@ -340,5 +403,6 @@ async fn proxy_to_udp(
         .await
         .context("write PROXY_ACCEPT")?;
 
+    metrics.proxy_udp_opened_inc();
     proxy::bridge_quic_udp(q_send, q_recv, udp).await
 }
