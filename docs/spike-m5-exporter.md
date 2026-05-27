@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-26
 **Roadmap:** [`ROADMAP-v0.3.md`](ROADMAP-v0.3.md) §M5
-**Binary:** [`crates/proteus-tools/src/bin/exporter-spike.rs`](../crates/proteus-tools/src/bin/exporter-spike.rs)
+**Binary:** _Removed post-M6._ (Lived at `crates/proteus-tools/src/bin/exporter-spike.rs`; see commit history.)
 **Result:** ✅ **Path A — exporter works.** Spec v0.2 unchanged. M6 unblocked.
 
 ## Setup
@@ -42,6 +42,6 @@ M5 Plan B (transcript-hash fallback) is not needed.
 Proceed in roadmap order: M1 (Config) → M2 (Keygen) → M3 (Basic QUIC) →
 M4 (Frame Codec) → M6 (Auth, reusing the exporter API exercised here).
 
-The `exporter-spike` binary stays in tree until M6 lands the real auth
-path; then it is removed in the same commit that adds M6's integration
-test.
+The `exporter-spike` binary was removed once M6's real auth path was
+verified end-to-end through `proteus-client` / `proteus-server`. This
+doc remains as the M5 historical record.
