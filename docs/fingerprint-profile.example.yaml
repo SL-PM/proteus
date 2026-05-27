@@ -1,0 +1,90 @@
+# PROTEUS — Fingerprint Profile Schema (v0.3 placeholder)
+#
+# Schema for storing empirical packet-size and timing distributions of
+# real browser HTTP/3 traffic to a target site. v0.3 defines the
+# format only — capture tooling (M15) and matching machinery (v0.5)
+# come later.
+#
+# A "profile" describes one (browser, target) pair on one network
+# trace, used at v0.5 to shape PROTEUS output to look like that pair.
+#
+# Histogram convention: each bin is a half-open interval [from, to)
+# in the unit named by the field (bytes, microseconds, milliseconds).
+# `count` is the number of observations that fell into the bin.
+
+profile_id: "chrome-cloudflare-en-2026Q2"   # stable identifier
+captured_at: "2026-05-27T12:00:00Z"          # RFC 3339 timestamp
+schema_version: 1                            # bump when fields change
+
+# ----- Source of the capture -----
+#
+# v0.5 may use these fields to weight or rotate profiles by locale,
+# browser version, time-of-day, etc.
+source:
+  browser: "Chrome 138"
+  os: "macOS 15.5"
+  target_host: "www.cloudflare.com"
+  target_ip: "104.16.132.229"                # for reproducibility
+  locale: "en-US"
+  capture_tool: "tcpdump 4.99 (M15 wrapper)"
+  notes: |
+    Cold-cache first-load of https://www.cloudflare.com/.
+    No request retries observed.
+
+# ----- QUIC Initial-packet lengths (client → server) -----
+#
+# The very first packet on the wire after the UDP socket binds. v0.5
+# padding work targets this distribution closely because it is the
+# most fingerprint-rich single packet in the trace.
+initial_packet_lengths_bytes:
+  bins:
+    - { from:    0, to:   500, count:   0 }
+    - { from:  500, to:  1000, count:   1 }
+    - { from: 1000, to:  1200, count:   1 }
+    - { from: 1200, to:  1500, count:   0 }
+
+# ----- General packet-size distribution, post-handshake -----
+#
+# Same histogram shape, both directions.
+packet_lengths_bytes:
+  client_to_server:
+    bins: []                                 # populated by the capture tool
+  server_to_client:
+    bins: []
+
+# ----- Inter-arrival time distribution -----
+#
+# In microseconds. Long-tail distributions are common; capture tooling
+# should bin generously (e.g. logarithmic spacing) to keep the tail
+# representable without exploding bin count.
+inter_arrival_us:
+  client_to_server:
+    bins: []
+  server_to_client:
+    bins: []
+
+# ----- Connection-lifetime statistics -----
+#
+# Per-session totals, in milliseconds. Used to time PROTEUS's own
+# session lifetimes plausibly.
+session_lifetime_ms:
+  bins: []
+
+# ----- Edge cases observed -----
+#
+# Free-form notes from the capture analyst. Not consumed by the v0.5
+# matching engine, but useful for triage when a generated PROTEUS
+# trace differs noticeably from this profile and you need to know
+# what odd-but-real behavior the cover host exhibits.
+edge_cases:
+  - "Server coalesces Initial+Handshake into a 1280-byte UDP packet"
+  - "TLS NewSessionTicket arrives ~85 ms post-handshake"
+  - "Periodic 32-byte PING frames every ~15s from the server"
+
+# ----- Provenance -----
+#
+# Optional. If the profile was derived from a public dataset or
+# combined from multiple captures, record that here.
+provenance:
+  sources: []                                # list of upstream profile_ids if merged
+  hash: ""                                   # SHA-256 of the raw pcap, for audit
