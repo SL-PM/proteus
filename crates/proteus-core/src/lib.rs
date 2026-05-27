@@ -8,5 +8,6 @@ pub mod frame;
 pub mod metrics;
 pub mod policy;
 pub mod proxy;
+pub mod ratelimit;
 pub mod replay;
 pub mod tls;

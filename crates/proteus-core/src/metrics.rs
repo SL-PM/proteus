@@ -19,6 +19,7 @@ pub struct Metrics {
     pub auth_attempts: AtomicU64,
     pub auth_success: AtomicU64,
     pub auth_failed: AtomicU64,
+    pub rate_limited: AtomicU64,
     pub replay_rejected: AtomicU64,
     pub policy_rejected: AtomicU64,
     pub proxy_tcp_opened: AtomicU64,
@@ -37,6 +38,7 @@ impl Metrics {
             auth_attempts: self.auth_attempts.load(Ordering::Relaxed),
             auth_success: self.auth_success.load(Ordering::Relaxed),
             auth_failed: self.auth_failed.load(Ordering::Relaxed),
+            rate_limited: self.rate_limited.load(Ordering::Relaxed),
             replay_rejected: self.replay_rejected.load(Ordering::Relaxed),
             policy_rejected: self.policy_rejected.load(Ordering::Relaxed),
             proxy_tcp_opened: self.proxy_tcp_opened.load(Ordering::Relaxed),
@@ -54,6 +56,9 @@ impl Metrics {
     }
     pub fn auth_failed_inc(&self) {
         self.auth_failed.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn rate_limited_inc(&self) {
+        self.rate_limited.fetch_add(1, Ordering::Relaxed);
     }
     pub fn replay_rejected_inc(&self) {
         self.replay_rejected.fetch_add(1, Ordering::Relaxed);
@@ -84,6 +89,7 @@ pub struct MetricsSnapshot {
     pub auth_attempts: u64,
     pub auth_success: u64,
     pub auth_failed: u64,
+    pub rate_limited: u64,
     pub replay_rejected: u64,
     pub policy_rejected: u64,
     pub proxy_tcp_opened: u64,
@@ -101,8 +107,11 @@ impl fmt::Display for MetricsSnapshot {
         )?;
         writeln!(
             f,
-            "reject:  {} replay, {} policy, {} upstream unreachable",
-            self.replay_rejected, self.policy_rejected, self.proxy_upstream_unreachable
+            "reject:  {} replay, {} policy, {} rate-limited, {} upstream unreachable",
+            self.replay_rejected,
+            self.policy_rejected,
+            self.rate_limited,
+            self.proxy_upstream_unreachable
         )?;
         writeln!(
             f,
@@ -134,11 +143,13 @@ mod tests {
         m.proxy_tcp_opened_inc();
         m.proxy_udp_opened_inc();
         m.proxy_upstream_unreachable_inc();
+        m.rate_limited_inc();
         let s = m.snapshot();
         assert_eq!(s.auth_attempts, 2);
         assert_eq!(s.auth_success, 1);
         assert_eq!(s.replay_rejected, 1);
         assert_eq!(s.policy_rejected, 1);
+        assert_eq!(s.rate_limited, 1);
         assert_eq!(s.proxy_tcp_opened, 1);
         assert_eq!(s.proxy_udp_opened, 1);
         assert_eq!(s.proxy_upstream_unreachable, 1);

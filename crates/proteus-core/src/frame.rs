@@ -244,4 +244,20 @@ mod tests {
         let got = r.unwrap();
         assert_eq!(got, f);
     }
+
+    #[test]
+    fn decode_never_panics_on_random_input() {
+        // M18.1 fuzz: feed Frame::decode random byte slices at several
+        // sizes and verify it never panics. Err is fine, Ok is fine —
+        // anything but a panic.
+        use rand::{RngCore, SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0xCAFE_BABE_DEAD_BEEF);
+        for size in [0usize, 1, 5, 15, 16, 17, 32, 64, 256, 1024, 4096] {
+            for _ in 0..200 {
+                let mut buf = vec![0u8; size];
+                rng.fill_bytes(&mut buf);
+                let _ = Frame::decode(&buf);
+            }
+        }
+    }
 }

@@ -34,6 +34,7 @@ use proteus_core::{
     metrics::Metrics,
     policy::PolicyChecker,
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
+    ratelimit::AuthRateLimiter,
     replay::ReplayCache,
     tls,
 };
@@ -49,6 +50,13 @@ const AUTH_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ALPN we advertise alongside `proteus/0.3` for the M13 decoy.
 const H3_ALPN: &[u8] = b"h3";
+
+/// Maximum PROTEUS auth attempts per peer IP per window. M18.1.
+const RATE_LIMIT_MAX: usize = 30;
+/// Rolling window for the auth rate limit.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+/// How often to sweep expired rate-limit buckets.
+const RATE_LIMIT_SWEEP_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Per spec v0.2 §8.3.
 const REPLAY_TTL: Duration = Duration::from_secs(300);
@@ -90,6 +98,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|p| Arc::new(PolicyChecker::from_config(p)));
     let metrics = Arc::new(Metrics::new());
+    let rate_limiter = Arc::new(AuthRateLimiter::new(RATE_LIMIT_MAX, RATE_LIMIT_WINDOW));
 
     println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
     println!("listening on: {}", endpoint.local_addr()?);
@@ -108,6 +117,11 @@ async fn main() -> Result<()> {
         "metrics:      snapshot every {}s to stderr",
         METRICS_SNAPSHOT_INTERVAL.as_secs()
     );
+    println!(
+        "rate limit:   {} auth attempts per {}s per peer IP",
+        rate_limiter.max_per_window(),
+        rate_limiter.window().as_secs()
+    );
     if registry.is_empty() {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
@@ -116,14 +130,18 @@ async fn main() -> Result<()> {
 
     spawn_replay_sweeper(replay.clone());
     spawn_metrics_logger(metrics.clone());
+    spawn_rate_limit_sweeper(rate_limiter.clone());
 
     while let Some(incoming) = endpoint.accept().await {
         let registry = registry.clone();
         let replay = replay.clone();
         let policy = policy.clone();
         let metrics = metrics.clone();
+        let rate_limiter = rate_limiter.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(incoming, registry, replay, policy, metrics).await {
+            if let Err(e) =
+                handle_conn(incoming, registry, replay, policy, metrics, rate_limiter).await
+            {
                 eprintln!("conn error: {e:#}");
             }
         });
@@ -159,12 +177,30 @@ fn spawn_metrics_logger(metrics: Arc<Metrics>) {
     });
 }
 
+fn spawn_rate_limit_sweeper(rate_limiter: Arc<AuthRateLimiter>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(RATE_LIMIT_SWEEP_INTERVAL);
+        tick.tick().await; // skip the immediate fire
+        loop {
+            tick.tick().await;
+            let dropped = rate_limiter.sweep();
+            if dropped > 0 {
+                eprintln!(
+                    "rate-limit: swept {dropped} expired buckets (now {})",
+                    rate_limiter.len()
+                );
+            }
+        }
+    });
+}
+
 async fn handle_conn(
     incoming: quinn::Incoming,
     registry: Arc<ClientRegistry>,
     replay: Arc<ReplayCache>,
     policy: Option<Arc<PolicyChecker>>,
     metrics: Arc<Metrics>,
+    rate_limiter: Arc<AuthRateLimiter>,
 ) -> Result<()> {
     let conn = incoming.await.context("handshake")?;
     let peer = conn.remote_address();
@@ -179,6 +215,15 @@ async fn handle_conn(
         }
         return Ok(());
     }
+
+    // M18.1: cap PROTEUS auth attempts per peer IP.
+    if let Err(e) = rate_limiter.check_and_record(peer.ip()) {
+        eprintln!("{peer}: rate-limited: {e}");
+        metrics.rate_limited_inc();
+        conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
+        return Ok(());
+    }
+
     println!("accepted {peer}");
 
     // ----- auth on the control stream -----
