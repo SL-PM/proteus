@@ -1,19 +1,36 @@
 # Open Items — manual actions for the operator
 
 Everything v0.3 cannot finish automatically. Split into:
-- **A.** v0.3 sign-off — close the loop on what's already built.
+- **A.** v0.3 sign-off — close the loop on what's already built. *✓ completed 2026-05-27*
 - **B.** Before any deployment — must do before v0.3 touches a real
   machine, even a lab one.
 - **C.** Optional polish — session-end housekeeping.
 
 ---
 
-## A. v0.3 sign-off
+## A. v0.3 sign-off — ✓ completed
 
-### A1. M14 capture + comparison report
+### A1. M14 capture + comparison report ✓
 
-The code-path side of M14 is done; only the pcap baselines + the
-diff report are missing. Acceptance checklist lives in
+**Status:** Done on 2026-05-27, commit `ac66d3f`. Report lives at
+[`m14-comparison-report.md`](m14-comparison-report.md). DoD reached
+**12/12**.
+
+Headline finding from the comparison: PROTEUS-reject connections
+last ~3 ms (14 packets) while a real H3 fetch to `www.cloudflare.com`
+lasted ~8 s (41 packets). Frame-size distributions are nearly
+identical (avg 641 B vs 672 B), so the DPI-visible difference is
+duration + packet count, not byte-level. v0.5 padding/timing work
+targets exactly this gap.
+
+The original procedure is preserved below as historical reference
+for re-runs and for v0.4 / v0.5 baseline comparisons.
+
+---
+
+#### Original procedure (history — kept for re-runs)
+
+Acceptance checklist lives in
 [`m14-invalid-client.md`](m14-invalid-client.md).
 
 Required: `sudo` + a curl build with HTTP/3 support.
@@ -55,7 +72,9 @@ Steps:
    gitignored by default; force-add them only if you want a checked-in
    reference baseline.
 
-After step 7, DoD item 11 is met → v0.3 reaches **12/12 DoD**.
+After step 7, DoD item 11 was met → v0.3 reached **12/12 DoD** on
+2026-05-27 (commit `ac66d3f`). The same procedure can be re-run any
+time for a v0.4 / v0.5 baseline comparison.
 
 ---
 
