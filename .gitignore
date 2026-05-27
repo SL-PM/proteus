@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# M15 capture artifacts — produced by scripts/capture-*.sh, may be large.
+captures/**/*.pcap
