@@ -18,6 +18,8 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 # M2.6b: server-side keypair generation when adding a client.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# M4.6: server-rendered admin UI (compile-time HTML, no JS build chain).
+maud = { version = "0.26", features = ["axum"] }
 proteus-core = { path = "../proteus-core" }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

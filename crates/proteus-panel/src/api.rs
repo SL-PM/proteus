@@ -38,7 +38,7 @@ use crate::{
     db::{Client, Db},
 };
 
-const SESSION_COOKIE: &str = "psid";
+pub(crate) const SESSION_COOKIE: &str = "psid";
 const SESSION_TTL: Duration = Duration::from_secs(8 * 3600); // 8 hours
 
 /// Shared application state: the client store + the live session map.
@@ -61,7 +61,7 @@ impl AppState {
         }
     }
 
-    fn create_session(&self, username: &str) -> String {
+    pub(crate) fn create_session(&self, username: &str) -> String {
         let token = random_b64(32, &URL_SAFE_NO_PAD);
         let now = Instant::now();
         let mut s = self.sessions.lock().expect("session lock");
@@ -76,14 +76,14 @@ impl AppState {
         token
     }
 
-    fn validate_session(&self, token: &str) -> Option<String> {
+    pub(crate) fn validate_session(&self, token: &str) -> Option<String> {
         let s = self.sessions.lock().expect("session lock");
         s.get(token)
             .filter(|sess| sess.expires > Instant::now())
             .map(|sess| sess.username.clone())
     }
 
-    fn destroy_session(&self, token: &str) {
+    pub(crate) fn destroy_session(&self, token: &str) {
         self.sessions.lock().expect("session lock").remove(token);
     }
 }
@@ -194,12 +194,7 @@ async fn login(
         return Err(ApiError::Unauthorized);
     }
     let token = st.create_session(&req.username);
-    let cookie = Cookie::build((SESSION_COOKIE, token))
-        .http_only(true)
-        .same_site(SameSite::Strict)
-        .path("/")
-        .build();
-    Ok((jar.add(cookie), StatusCode::NO_CONTENT))
+    Ok((jar.add(session_cookie(token)), StatusCode::NO_CONTENT))
 }
 
 async fn logout(State(st): State<AppState>, jar: CookieJar) -> (CookieJar, StatusCode) {
@@ -225,10 +220,7 @@ async fn create_client(
     State(st): State<AppState>,
     Json(req): Json<CreateClientReq>,
 ) -> Result<(StatusCode, Json<CreateClientResp>), ApiError> {
-    let id = req
-        .id
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("c-{}", random_b64(6, &URL_SAFE_NO_PAD)));
+    let id = req.id.filter(|s| !s.is_empty()).unwrap_or_else(random_id);
 
     if st.db.get_client(&id).await.map_err(internal)?.is_some() {
         return Err(ApiError::Conflict(format!("client '{id}' already exists")));
@@ -314,32 +306,34 @@ async fn delete_client(
 
 // ----------------- router + helpers -----------------
 
-/// Build the full panel router (health/root + the management API) with
-/// the given state.
+/// Build the full panel router: `/health` + the JSON management API
+/// (`/api/*`) plus the HTML admin UI (M4.6, added by [`crate::web`],
+/// which owns `/`, `/login`, `/logout`, and the form-post routes).
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/health", get(health))
-        .route("/", get(index))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/clients", get(list_clients).post(create_client))
         .route("/api/clients/:id", get(get_client).delete(delete_client))
         .route("/api/clients/:id/enable", post(enable_client))
-        .route("/api/clients/:id/disable", post(disable_client))
-        .with_state(state)
+        .route("/api/clients/:id/disable", post(disable_client));
+    crate::web::add_routes(api).with_state(state)
 }
 
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn index() -> &'static str {
-    "PROTEUS Control — management portal. See docs/PROTEUS-v0.6-control-plan.md"
+/// A fresh auto-generated client id (`c-<random>`), used when the
+/// caller doesn't supply one.
+pub(crate) fn random_id() -> String {
+    format!("c-{}", random_b64(6, &URL_SAFE_NO_PAD))
 }
 
 /// Generate a fresh Ed25519 keypair, returning `(private_b64, public_b64)`
 /// in the same standard-base64 form `proteus-tools keygen` produces.
-fn generate_keypair() -> (String, String) {
+pub(crate) fn generate_keypair() -> (String, String) {
     use ed25519_dalek::SigningKey;
     let sk = SigningKey::generate(&mut OsRng);
     let pk = sk.verifying_key();
@@ -350,4 +344,14 @@ fn random_b64(n: usize, engine: &base64::engine::GeneralPurpose) -> String {
     let mut buf = vec![0u8; n];
     OsRng.fill_bytes(&mut buf);
     engine.encode(buf)
+}
+
+/// Build the session cookie (httponly, SameSite=Strict, path=/). Shared
+/// by the JSON login (api) and the HTML login (web).
+pub(crate) fn session_cookie(token: String) -> Cookie<'static> {
+    Cookie::build((SESSION_COOKIE, token))
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .path("/")
+        .build()
 }
