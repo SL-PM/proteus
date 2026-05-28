@@ -148,6 +148,7 @@ impl TestServer {
             },
             tls: None,
             clients: Some(clients),
+            clients_db: None,
             policy: Some(PolicyConfig {
                 block_private_ranges: false,
                 allowed_ports: vec![],
@@ -162,7 +163,7 @@ impl TestServer {
             log_level: "info".to_string(),
         };
 
-        let server = Server::bind(cfg).context("Server::bind")?;
+        let server = Server::bind(cfg).await.context("Server::bind")?;
         let addr = server.local_addr();
         let cert_sha256 = server.cert_sha256_hex().to_string();
         let metrics = server.metrics();

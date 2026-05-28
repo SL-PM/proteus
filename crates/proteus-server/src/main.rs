@@ -30,7 +30,7 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = ServerConfig::from_yaml_file(&cli.config).context("load server config")?;
-    let server = Server::bind(cfg.clone())?;
+    let server = Server::bind(cfg.clone()).await?;
 
     println!("proteus-server v{}", env!("CARGO_PKG_VERSION"));
     println!("listening on: {}", server.local_addr());

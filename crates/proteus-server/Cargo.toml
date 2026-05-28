@@ -6,6 +6,8 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
+# M3.6: lock-free hot-swap of the client registry on DB reload.
+arc-swap = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 h3 = "0.0.8"
@@ -13,11 +15,18 @@ h3-quinn = "0.0.10"
 http = "1"
 proteus-core = { path = "../proteus-core" }
 quinn = "0.11"
+# M3.6: read the proteus-panel client store (read-only registry source).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+] }
 tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# M3.6: seed the client store with the real panel schema in tests.
+proteus-panel = { path = "../proteus-panel" }
 rand = "0.8"
 rustls = "0.23"
 tempfile = "3"

@@ -24,6 +24,12 @@ pub struct ServerConfig {
     /// M2/M6: client_id -> base64-encoded Ed25519 public key.
     #[serde(default)]
     pub clients: Option<HashMap<String, String>>,
+    /// v0.6 M3.6: path to the proteus-panel SQLite client store. When
+    /// set, the server hot-reloads its client registry from the DB's
+    /// `clients` table (active clients only), merged on top of the
+    /// static `clients:` map above.
+    #[serde(default)]
+    pub clients_db: Option<PathBuf>,
     /// M12: policy engine.
     #[serde(default)]
     pub policy: Option<PolicyConfig>,

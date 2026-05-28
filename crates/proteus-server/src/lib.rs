@@ -23,12 +23,14 @@
 //!   close code; the `run` future resolves shortly after.
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use proteus_core::{
     aead::{self, ProxyStreamAead},
@@ -49,6 +51,8 @@ use proteus_core::{
     tls,
 };
 use tokio::net::{TcpStream, UdpSocket};
+
+mod client_db;
 
 // ----------------- public constants -----------------
 
@@ -79,13 +83,20 @@ pub const REPLAY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the metrics snapshot is written to stderr.
 pub const METRICS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// v0.6 M3.6: how often the client registry is reloaded from the panel
+/// DB (when `clients_db` is configured). A panel change (add/disable/
+/// expire a client) takes effect within this window.
+pub const REGISTRY_RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+
 // ----------------- Server struct -----------------
 
 /// Bag of shared per-connection state. Cloned cheaply into every
 /// `tokio::spawn`ed `handle_conn`.
 #[derive(Clone)]
 struct ServerState {
-    registry: Arc<ClientRegistry>,
+    /// Hot-swappable client registry (M3.6): the `clients_db` reloader
+    /// replaces it atomically; static-only deployments load it once.
+    registry: Arc<ArcSwap<ClientRegistry>>,
     replay: Arc<ReplayCache>,
     policy: Option<Arc<PolicyChecker>>,
     metrics: Arc<Metrics>,
@@ -117,7 +128,7 @@ struct ServerState {
 ///
 /// Usage:
 /// ```ignore
-/// let server = Server::bind(cfg)?;
+/// let server = Server::bind(cfg).await?;
 /// println!("listening on {}", server.local_addr());
 /// server.run().await
 /// ```
@@ -134,14 +145,30 @@ impl Server {
     /// bind the QUIC endpoint, and assemble all per-connection
     /// state. Does NOT start accepting connections — call
     /// [`Server::run`] for that.
-    pub fn bind(cfg: ServerConfig) -> Result<Self> {
+    pub async fn bind(cfg: ServerConfig) -> Result<Self> {
         tls::install_crypto_provider();
         let (qcfg, cert) = tls::server_config(cfg.tls.as_ref())?;
         let endpoint = quinn::Endpoint::server(qcfg, cfg.listen.addr)
             .with_context(|| format!("bind {}", cfg.listen.addr))?;
         let local_addr = endpoint.local_addr().context("query bound local_addr")?;
 
-        let registry = Arc::new(ClientRegistry::from_config_map(cfg.clients.as_ref())?);
+        // M3.6: build the client registry. Static `clients:` map is the
+        // base; if `clients_db` is set, overlay the panel DB's active
+        // clients and hot-reload them on a timer.
+        let static_clients: HashMap<String, String> = cfg.clients.clone().unwrap_or_default();
+        let registry = Arc::new(ArcSwap::from_pointee(ClientRegistry::from_config_map(
+            Some(&static_clients),
+        )?));
+        if let Some(db_path) = cfg.clients_db.as_ref() {
+            let db_path = db_path.to_string_lossy().to_string();
+            // Initial load before serving, so DB clients are usable
+            // immediately (not only after the first reload tick).
+            match load_and_build_registry(&db_path, &static_clients).await {
+                Ok(reg) => registry.store(Arc::new(reg)),
+                Err(e) => eprintln!("clients_db initial load failed ({db_path}): {e:#}"),
+            }
+            spawn_registry_reloader(registry.clone(), db_path, static_clients.clone());
+        }
         let replay = Arc::new(ReplayCache::new(REPLAY_TTL));
         let policy: Option<Arc<PolicyChecker>> = cfg
             .policy
@@ -257,9 +284,9 @@ impl Server {
         self.state.metrics.clone()
     }
 
-    /// Number of configured client entries.
+    /// Number of currently-loaded client entries (static + DB).
     pub fn clients_len(&self) -> usize {
-        self.state.registry.len()
+        self.state.registry.load().len()
     }
 
     /// Whether a `policy:` section was present in the config.
@@ -404,6 +431,47 @@ fn spawn_rate_limit_sweeper(rate_limiter: Arc<AuthRateLimiter>) {
     });
 }
 
+/// M3.6: build a [`ClientRegistry`] from the static map overlaid with
+/// the panel DB's currently-active clients.
+async fn load_and_build_registry(
+    db_path: &str,
+    static_clients: &HashMap<String, String>,
+) -> Result<ClientRegistry> {
+    let db = client_db::ClientDb::open(db_path).await?;
+    let active = db.load_active().await?;
+    let mut combined = static_clients.clone();
+    combined.extend(active); // DB clients overlay/extend the static map
+    ClientRegistry::from_config_map(Some(&combined))
+}
+
+/// M3.6: periodically reload the registry from the panel DB and swap it
+/// in atomically. Logs only when the client count changes.
+fn spawn_registry_reloader(
+    registry: Arc<ArcSwap<ClientRegistry>>,
+    db_path: String,
+    static_clients: HashMap<String, String>,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REGISTRY_RELOAD_INTERVAL);
+        tick.tick().await; // skip immediate (bind() already did the first load)
+        let mut last_len = registry.load().len();
+        loop {
+            tick.tick().await;
+            match load_and_build_registry(&db_path, &static_clients).await {
+                Ok(reg) => {
+                    let n = reg.len();
+                    registry.store(Arc::new(reg));
+                    if n != last_len {
+                        eprintln!("clients_db: registry reloaded ({last_len} -> {n} clients)");
+                        last_len = n;
+                    }
+                }
+                Err(e) => eprintln!("clients_db reload failed: {e:#}"),
+            }
+        }
+    });
+}
+
 // ----------------- per-connection handler -----------------
 
 async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()> {
@@ -473,7 +541,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
 
     let pad_buckets = state.padding_buckets.as_deref().map(|v| v.as_slice());
 
-    let client_id = match state.registry.verify(&req, &exporter) {
+    let client_id = match state.registry.load().verify(&req, &exporter) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("{peer}: auth FAIL ({}): {e:#}", req.client_id);
