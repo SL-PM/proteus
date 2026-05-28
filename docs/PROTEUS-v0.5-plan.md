@@ -234,7 +234,8 @@ profile-driven sampling).
 | M9.5 | `Pacer` token bucket + `burst` config + unit tests ✅ | small |
 | M10.5 | Wire pacer into bridges + burst integration test + [`m10.5-pacer-signoff.md`](m10.5-pacer-signoff.md) ✅ | small |
 | M11.5 | `proteus_core::fingerprint` — TV-distance / best-classifier-accuracy math ✅ | small |
-| M12.5 | Measurement harness + [`m12.5-fingerprint-eval-signoff.md`](m12.5-fingerprint-eval-signoff.md) ✅ | small |
+| M12.5 | Size-axis measurement harness + [`m12.5-fingerprint-eval-signoff.md`](m12.5-fingerprint-eval-signoff.md) ✅ | small |
+| M13.5 | Timing-axis measurement (jitter on a regular cadence) — folded into the M12.5 sign-off ✅ | small |
 
 **v0.5-rc.2 = M6.5 through M8.5.** M9.5–M10.5 (token-bucket pacer,
 → v0.5.1) refine the jitter's latency cost. Profile-driven size +

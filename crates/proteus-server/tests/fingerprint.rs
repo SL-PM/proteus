@@ -183,3 +183,72 @@ async fn padding_reduces_activity_distinguishability() -> Result<()> {
     );
     Ok(())
 }
+
+/// M13.5 — timing axis. The size measurement above used the live wire
+/// (deterministic). Live inter-arrival timing is wall-clock-noisy, so
+/// here we measure the jitter *mechanism* deterministically instead:
+/// model a perfectly regular send schedule (a strong timing
+/// fingerprint — e.g. a periodic heartbeat at a fixed cadence) and
+/// apply the real `Jitter` sampler with a seeded RNG, then compare the
+/// resulting inter-arrival gap distribution with vs. without jitter.
+///
+/// Model: each frame becomes ready at `i·G` and is sent after an
+/// independent jitter delay `d_i`, so the observed gap is
+/// `G + d_i − d_{i-1}`. (This is the faithful per-frame-jitter effect:
+/// inter-arrival = nominal cadence plus the difference of consecutive
+/// delays.)
+#[test]
+fn jitter_destroys_a_regular_timing_signature() {
+    use proteus_core::jitter::Jitter;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(0x7117_2026);
+    let g_ms: i64 = 10; // a precise 10ms periodic cadence
+    let n = 300usize;
+    let jitter = Jitter::new(0, 8);
+
+    // Without jitter: every gap is exactly the cadence → a sharp spike.
+    let off_gaps: Vec<u64> = std::iter::repeat_n(g_ms as u64, n).collect();
+
+    // With jitter: gap_i = G + d_i − d_{i-1} (clamped ≥ 0).
+    let delays: Vec<i64> = (0..=n)
+        .map(|_| jitter.next_delay_with(&mut rng).as_millis() as i64)
+        .collect();
+    let on_gaps: Vec<u64> = (1..=n)
+        .map(|i| (g_ms + delays[i] - delays[i - 1]).max(0) as u64)
+        .collect();
+
+    let off = Distribution::from_samples(off_gaps.iter().copied());
+    let on = Distribution::from_samples(on_gaps.iter().copied());
+    let tv = off.total_variation(&on);
+
+    let mean = |g: &[u64]| g.iter().sum::<u64>() as f64 / g.len() as f64;
+    let (m_off, m_on) = (mean(&off_gaps), mean(&on_gaps));
+
+    eprintln!("--- M13.5 timing-axis (inter-arrival gaps, ms) ---");
+    eprintln!(
+        "  off: distinct_bins={}  mean={m_off:.2}",
+        off.distinct_bins()
+    );
+    eprintln!(
+        "  on : distinct_bins={}  mean={m_on:.2}",
+        on.distinct_bins()
+    );
+    eprintln!("  TV(off,on)={tv:.3}  (regularity destroyed)");
+
+    // Regularity destroyed: a single-spike timing signature spreads out.
+    assert_eq!(off.distinct_bins(), 1, "no-jitter cadence is a sharp spike");
+    assert!(
+        on.distinct_bins() >= 5,
+        "jitter should spread the gap distribution; got {} bins",
+        on.distinct_bins()
+    );
+    // Honest limit: jitter does NOT change the MEAN cadence — an analyst
+    // measuring average inter-arrival still recovers ~G. (Uniform jitter
+    // is a regularity-breaker, not a cadence-hider; matching a target
+    // cadence needs profile-driven timing.)
+    assert!(
+        (m_off - m_on).abs() < 2.0,
+        "mean cadence should be ~preserved: off={m_off:.2} on={m_on:.2}"
+    );
+}
