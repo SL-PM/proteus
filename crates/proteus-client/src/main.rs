@@ -99,10 +99,10 @@ async fn main() -> Result<()> {
     // v0.5-rc.2 M7.5: client-side send-path timing jitter. Validate the
     // range up front; build a sampler if enabled.
     cfg.timing_jitter.validate()?;
-    let jitter: Option<proteus_core::jitter::Jitter> = if cfg.timing_jitter.enabled {
-        Some(proteus_core::jitter::Jitter::new(
-            cfg.timing_jitter.min_ms,
-            cfg.timing_jitter.max_ms,
+    let jitter: Option<proteus_core::jitter::JitterPlan> = if cfg.timing_jitter.enabled {
+        Some(proteus_core::jitter::JitterPlan::new(
+            proteus_core::jitter::Jitter::new(cfg.timing_jitter.min_ms, cfg.timing_jitter.max_ms),
+            cfg.timing_jitter.burst,
         ))
     } else {
         None
@@ -162,7 +162,7 @@ async fn handle_socks5(
     qconn: Arc<quinn::Connection>,
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
-    jitter: Option<proteus_core::jitter::Jitter>,
+    jitter: Option<proteus_core::jitter::JitterPlan>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     // ----- Greeting: [ver, nmethods, methods...] -----

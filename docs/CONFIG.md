@@ -67,14 +67,22 @@ timing_jitter:
   enabled: true
   min_ms: 0
   max_ms: 5            # uniform delay [min_ms, max_ms] before each proxy-stream frame
+  burst: 0             # v0.5.1 token bucket: free sends before pacing (0 = per-frame)
 ```
 
 > **v0.5 timing-jitter note:** unlike padding, jitter needs NO wire
 > agreement — the receiver is oblivious. The cost is latency: a uniform
-> `[min, max]` delay caps bulk throughput at roughly
+> `[min, max]` delay caps sustained throughput at roughly
 > `frame_size / avg_delay` (≈300 KB/s at a 5 ms average). Keep the range
 > small for bulk traffic; widen it only for interactive/low-volume use.
-> See [`m8.5-timing-jitter-signoff.md`](m8.5-timing-jitter-signoff.md) §4.
+>
+> **`burst` (v0.5.1):** a token-bucket allowance. `0` (default) delays
+> every frame. `N` lets the first `N` queued frames through with **no
+> delay** (refilling over idle time), so short interactive bursts stay
+> snappy while sustained traffic is still paced. Note: a large `burst`
+> means short flows aren't timing-shaped at all — size it small if
+> obfuscating short flows matters. Sustained throughput ceiling is
+> unchanged. See [`m10.5-pacer-signoff.md`](m10.5-pacer-signoff.md).
 
 > **v0.5 padding note:** padded and un-padded frames are NOT
 > wire-compatible. `padding.enabled` defaults to `false` so a v0.4

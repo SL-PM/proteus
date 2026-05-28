@@ -231,10 +231,13 @@ profile-driven sampling).
 | M6.5 | `proteus_core::jitter` module (bounded delay sampler) + `TimingJitterConfig` + this design ✅ | small |
 | M7.5 | Wire-up: apply jitter on the proxy-stream send path (server + client bridges) ✅ | small |
 | M8.5 | Tests (sampler bounds + data round-trips with jitter on) + [`m8.5-timing-jitter-signoff.md`](m8.5-timing-jitter-signoff.md) ✅ | small |
+| M9.5 | `Pacer` token bucket + `burst` config + unit tests ✅ | small |
+| M10.5 | Wire pacer into bridges + burst integration test + [`m10.5-pacer-signoff.md`](m10.5-pacer-signoff.md) ✅ | small |
 
-**v0.5-rc.2 = M6.5 through M8.5, all complete.** Profile-driven
-size + inter-arrival sampling (needs a capture corpus) and a
-lower-overhead token-bucket pacer remain deferred.
+**v0.5-rc.2 = M6.5 through M8.5.** M9.5–M10.5 (token-bucket pacer,
+→ v0.5.1) refine the jitter's latency cost. Profile-driven size +
+inter-arrival sampling (needs a capture corpus) — the real A7 closer —
+remains deferred.
 
 ## 7. Migration impact
 

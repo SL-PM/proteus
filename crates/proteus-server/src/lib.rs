@@ -105,7 +105,7 @@ struct ServerState {
     /// v0.5-rc.2 M7.5: when `Some`, the server applies a bounded random
     /// delay before each outgoing proxy-stream DATA frame. `None` = no
     /// timing jitter (send timing identical to rc.1).
-    jitter: Option<proteus_core::jitter::Jitter>,
+    jitter: Option<proteus_core::jitter::JitterPlan>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -183,13 +183,17 @@ impl Server {
             None
         };
 
-        // v0.5-rc.2 M7.5: send-path timing jitter. Validate the range
-        // up front so a misconfigured deployment fails at bind time.
+        // v0.5 M7.5/M9.5: send-path timing jitter + token-bucket burst.
+        // Validate the range up front so a misconfigured deployment
+        // fails at bind time.
         cfg.timing_jitter.validate()?;
-        let jitter: Option<proteus_core::jitter::Jitter> = if cfg.timing_jitter.enabled {
-            Some(proteus_core::jitter::Jitter::new(
-                cfg.timing_jitter.min_ms,
-                cfg.timing_jitter.max_ms,
+        let jitter: Option<proteus_core::jitter::JitterPlan> = if cfg.timing_jitter.enabled {
+            Some(proteus_core::jitter::JitterPlan::new(
+                proteus_core::jitter::Jitter::new(
+                    cfg.timing_jitter.min_ms,
+                    cfg.timing_jitter.max_ms,
+                ),
+                cfg.timing_jitter.burst,
             ))
         } else {
             None
@@ -292,9 +296,11 @@ impl Server {
             .map(|i| (i.interval.as_secs(), i.bucket))
     }
 
-    /// v0.5-rc.2: send-path timing jitter (min_ms, max_ms) if active.
-    pub fn jitter_summary(&self) -> Option<(u64, u64)> {
-        self.state.jitter.map(|j| (j.min_ms(), j.max_ms()))
+    /// v0.5: send-path timing jitter (min_ms, max_ms, burst) if active.
+    pub fn jitter_summary(&self) -> Option<(u64, u64, u32)> {
+        self.state
+            .jitter
+            .map(|p| (p.jitter.min_ms(), p.jitter.max_ms(), p.burst))
     }
 
     /// Reference to the underlying Quinn endpoint. Tests can use this
@@ -533,7 +539,7 @@ async fn handle_proxy_stream(
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
-    jitter: Option<proteus_core::jitter::Jitter>,
+    jitter: Option<proteus_core::jitter::JitterPlan>,
 ) -> Result<()> {
     // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
     // post-auth. Derive this stream's key + (send, recv) pair from the
@@ -663,7 +669,7 @@ async fn proxy_to_tcp(
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
-    jitter: Option<proteus_core::jitter::Jitter>,
+    jitter: Option<proteus_core::jitter::JitterPlan>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -755,7 +761,7 @@ async fn proxy_to_udp(
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
-    jitter: Option<proteus_core::jitter::Jitter>,
+    jitter: Option<proteus_core::jitter::JitterPlan>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {

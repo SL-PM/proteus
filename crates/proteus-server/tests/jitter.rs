@@ -167,3 +167,54 @@ async fn larger_transfer_survives_jitter() -> Result<()> {
     endpoint.wait_idle().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn token_bucket_burst_does_not_serialize() -> Result<()> {
+    // M9.5: with a large per-frame delay (100ms) BUT a burst allowance
+    // bigger than the traffic, the token bucket lets every echo frame
+    // through for free — so the exchange finishes far faster than the
+    // per-frame-jitter worst case (which would be ~delay × frames).
+    // burst = 50 >> the handful of server→client frames we generate.
+    let server = TestServer::start_jittered_burst("alice", 100, 100, 50).await?;
+    let echo_port = spawn_tcp_echo().await;
+
+    let endpoint = make_client_endpoint(&server.cert_sha256)?;
+    let conn = endpoint.connect(server.addr, "localhost")?.await?;
+    let session_key = run_auth(&conn, &server.client_id, &server.signing_key).await?;
+    let (mut q_send, mut q_recv, mut sa, stream_id) =
+        open_tcp_proxy(&conn, &session_key, "127.0.0.1", echo_port).await?;
+
+    let payload: Vec<u8> = (0..800u32).map(|i| (i % 251) as u8).collect();
+    let data = Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id,
+        payload: bytes::Bytes::from(payload.clone()),
+    };
+
+    let start = Instant::now();
+    write_frame_aead(&mut q_send, &data, &mut sa.send).await?;
+    let echo = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_frame_aead(&mut q_recv, &mut sa.recv),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timeout waiting for burst-paced echo"))??;
+    let elapsed = start.elapsed();
+
+    // Correctness under pacing.
+    assert_eq!(echo.frame_type, FrameType::Data);
+    assert_eq!(echo.payload.as_ref(), payload.as_slice());
+
+    // The single echo frame rode a free burst token → no 100ms delay.
+    // Generous bound (well under the 100ms per-frame delay) keeps this
+    // non-flaky while still proving the burst bypassed pacing.
+    assert!(
+        elapsed < Duration::from_millis(80),
+        "burst-token send took {elapsed:?}; expected ~free (≪100ms delay)"
+    );
+
+    conn.close(0u32.into(), b"test done");
+    endpoint.wait_idle().await;
+    Ok(())
+}

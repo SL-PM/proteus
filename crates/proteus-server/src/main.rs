@@ -87,7 +87,9 @@ async fn main() -> Result<()> {
     println!(
         "timing jitter: {}",
         match server.jitter_summary() {
-            Some((min, max)) => format!("on, {min}–{max}ms delay before each proxy-stream frame"),
+            Some((min, max, 0)) => format!("on, {min}–{max}ms delay per proxy-stream frame"),
+            Some((min, max, burst)) =>
+                format!("on, {min}–{max}ms delay, token-bucket burst {burst}"),
             None => "off".to_string(),
         }
     );
