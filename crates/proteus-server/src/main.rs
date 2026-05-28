@@ -84,6 +84,13 @@ async fn main() -> Result<()> {
             None => "off".to_string(),
         }
     );
+    println!(
+        "timing jitter: {}",
+        match server.jitter_summary() {
+            Some((min, max)) => format!("on, {min}–{max}ms delay before each proxy-stream frame"),
+            None => "off".to_string(),
+        }
+    );
     if server.clients_len() == 0 {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }

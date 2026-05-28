@@ -181,6 +181,7 @@ pub async fn bridge_quic_tcp<R, W>(
     mut aead_recv: crate::aead::InnerAead,
     wire_buckets: Option<Vec<usize>>,
     idle: Option<IdlePad>,
+    jitter: Option<crate::jitter::Jitter>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -232,6 +233,11 @@ where
                         stream_id,
                         payload: Bytes::copy_from_slice(&buf[..n]),
                     };
+                    // v0.5-rc.2 M7.5: timing jitter before the real
+                    // DATA send (NOT on idle PINGs — see plan §11.3).
+                    if let Some(j) = jitter {
+                        tokio::time::sleep(j.next_delay()).await;
+                    }
                     write_frame_aead_maybe_padded(
                         &mut q_send,
                         &frame,
@@ -304,6 +310,7 @@ pub async fn bridge_quic_udp(
     mut aead_recv: crate::aead::InnerAead,
     wire_buckets: Option<Vec<usize>>,
     idle: Option<IdlePad>,
+    jitter: Option<crate::jitter::Jitter>,
 ) -> anyhow::Result<()> {
     use std::{sync::Arc, time::Duration, time::Instant};
 
@@ -362,6 +369,11 @@ pub async fn bridge_quic_udp(
                         stream_id,
                         payload: Bytes::copy_from_slice(&buf[..n]),
                     };
+                    // v0.5-rc.2 M7.5: timing jitter before the real
+                    // DATA send (NOT on idle PINGs — see plan §11.3).
+                    if let Some(j) = jitter {
+                        tokio::time::sleep(j.next_delay()).await;
+                    }
                     write_frame_aead_maybe_padded(
                         &mut q_send,
                         &frame,

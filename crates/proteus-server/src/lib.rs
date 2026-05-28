@@ -102,6 +102,10 @@ struct ServerState {
     /// v0.5 M3.5: when `Some`, the server emits idle dummy PING frames
     /// per proxy stream during quiet periods. `None` = no idle padding.
     idle_pad: Option<proxy::IdlePad>,
+    /// v0.5-rc.2 M7.5: when `Some`, the server applies a bounded random
+    /// delay before each outgoing proxy-stream DATA frame. `None` = no
+    /// timing jitter (send timing identical to rc.1).
+    jitter: Option<proteus_core::jitter::Jitter>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -179,6 +183,18 @@ impl Server {
             None
         };
 
+        // v0.5-rc.2 M7.5: send-path timing jitter. Validate the range
+        // up front so a misconfigured deployment fails at bind time.
+        cfg.timing_jitter.validate()?;
+        let jitter: Option<proteus_core::jitter::Jitter> = if cfg.timing_jitter.enabled {
+            Some(proteus_core::jitter::Jitter::new(
+                cfg.timing_jitter.min_ms,
+                cfg.timing_jitter.max_ms,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             endpoint,
             local_addr,
@@ -193,6 +209,7 @@ impl Server {
                 decoy_headers,
                 padding_buckets,
                 idle_pad,
+                jitter,
             },
         })
     }
@@ -273,6 +290,11 @@ impl Server {
             .idle_pad
             .as_ref()
             .map(|i| (i.interval.as_secs(), i.bucket))
+    }
+
+    /// v0.5-rc.2: send-path timing jitter (min_ms, max_ms) if active.
+    pub fn jitter_summary(&self) -> Option<(u64, u64)> {
+        self.state.jitter.map(|j| (j.min_ms(), j.max_ms()))
     }
 
     /// Reference to the underlying Quinn endpoint. Tests can use this
@@ -466,6 +488,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
         let session_key = session_key.clone();
         let padding_buckets = state.padding_buckets.clone();
         let idle_pad = state.idle_pad.clone();
+        let jitter = state.jitter;
         tokio::spawn(async move {
             if let Err(e) = handle_proxy_stream(
                 q_send,
@@ -475,6 +498,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
                 session_key,
                 padding_buckets,
                 idle_pad,
+                jitter,
             )
             .await
             {
@@ -509,6 +533,7 @@ async fn handle_proxy_stream(
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
+    jitter: Option<proteus_core::jitter::Jitter>,
 ) -> Result<()> {
     // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
     // post-auth. Derive this stream's key + (send, recv) pair from the
@@ -560,6 +585,7 @@ async fn handle_proxy_stream(
                 stream_id,
                 padding_buckets,
                 idle_pad,
+                jitter,
             )
             .await
         }
@@ -576,6 +602,7 @@ async fn handle_proxy_stream(
                 stream_id,
                 padding_buckets,
                 idle_pad,
+                jitter,
             )
             .await
         }
@@ -636,6 +663,7 @@ async fn proxy_to_tcp(
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
+    jitter: Option<proteus_core::jitter::Jitter>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -709,6 +737,7 @@ async fn proxy_to_tcp(
         aead_recv,
         bridge_buckets,
         idle_pad,
+        jitter,
     )
     .await
 }
@@ -726,6 +755,7 @@ async fn proxy_to_udp(
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
+    jitter: Option<proteus_core::jitter::Jitter>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -809,6 +839,7 @@ async fn proxy_to_udp(
         aead_recv,
         bridge_buckets,
         idle_pad,
+        jitter,
     )
     .await
 }

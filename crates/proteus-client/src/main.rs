@@ -96,6 +96,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    // v0.5-rc.2 M7.5: client-side send-path timing jitter. Validate the
+    // range up front; build a sampler if enabled.
+    cfg.timing_jitter.validate()?;
+    let jitter: Option<proteus_core::jitter::Jitter> = if cfg.timing_jitter.enabled {
+        Some(proteus_core::jitter::Jitter::new(
+            cfg.timing_jitter.min_ms,
+            cfg.timing_jitter.max_ms,
+        ))
+    } else {
+        None
+    };
+
     let req = AuthRequest::sign(&cfg.identity.client_id, &sk, &exporter)?;
     write_frame_maybe_padded(
         &mut ctrl_send,
@@ -138,7 +150,7 @@ async fn main() -> Result<()> {
         let session_key = session_key.clone();
         let pad_buckets = pad_buckets.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, conn, session_key, pad_buckets).await {
+            if let Err(e) = handle_socks5(sock, conn, session_key, pad_buckets, jitter).await {
                 eprintln!("socks5 {peer}: {e:#}");
             }
         });
@@ -150,6 +162,7 @@ async fn handle_socks5(
     qconn: Arc<quinn::Connection>,
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
+    jitter: Option<proteus_core::jitter::Jitter>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     // ----- Greeting: [ver, nmethods, methods...] -----
@@ -258,6 +271,7 @@ async fn handle_socks5(
     let (tcp_r, tcp_w) = sock.into_split();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
     // Idle padding is server-only in v0.5-rc.1; client passes None.
+    // Timing jitter (M7.5) IS applied client-side on the send path.
     proxy::bridge_quic_tcp(
         q_send,
         q_recv,
@@ -267,6 +281,7 @@ async fn handle_socks5(
         sa.recv,
         bridge_buckets,
         None,
+        jitter,
     )
     .await
 }
