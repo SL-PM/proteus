@@ -12,4 +12,14 @@ license = "AGPL-3.0-or-later"
 anyhow = "1"
 axum = "0.7"
 proteus-core = { path = "../proteus-core" }
+# M1.6: SQLite client store. Runtime query API (no compile-time DATABASE_URL
+# needed); SQLite is local so no TLS feature.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+] }
 tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+tempfile = "3"
