@@ -20,7 +20,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use proteus_core::{
     aead::{self, ProxyStreamAead},
-    auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, load_signing_key},
+    auth::{
+        AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN, SigningKey, load_signing_key,
+        parse_signing_key_b64,
+    },
     config::ClientConfig,
     fingerprint::Distribution,
     frame::{
@@ -29,6 +32,7 @@ use proteus_core::{
     },
     jitter::{Jitter, JitterPlan},
     proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
+    subscription::Subscription,
     tls,
 };
 use tokio::{
@@ -142,30 +146,25 @@ impl RunningClient {
     }
 }
 
-/// Dial the PROTEUS server from `cfg`, authenticate, and start the
-/// SOCKS5 listener. Returns once auth succeeds and the listener is
-/// bound; the accept loop runs in a background task.
+/// Everything `connect_inner` needs: server endpoint + identity (inline
+/// signing key) + local SOCKS5 address + pre-built per-stream shaping.
+struct ConnectParams {
+    server_addr: SocketAddr,
+    sni: String,
+    cert_sha256: String,
+    client_id: String,
+    sk: SigningKey,
+    socks5_listen: SocketAddr,
+    pad_buckets: Option<Arc<Vec<usize>>>,
+    jitter: Option<JitterPlan>,
+    profile_dist: Option<Arc<Distribution>>,
+}
+
+/// Dial the PROTEUS server from a parsed config file, authenticate, and
+/// start the SOCKS5 listener. Returns once auth succeeds and the
+/// listener is bound; the accept loop runs in a background task.
 pub async fn connect(cfg: ClientConfig) -> Result<RunningClient> {
     let sk = load_signing_key(&cfg.identity.private_key)?;
-
-    tls::install_crypto_provider();
-    let qcfg = tls::client_config(&cfg.server.cert_sha256)?;
-
-    let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let mut endpoint = quinn::Endpoint::client(local).context("bind client UDP")?;
-    endpoint.set_default_client_config(qcfg);
-
-    let conn = endpoint
-        .connect(cfg.server.addr, &cfg.server.sni)
-        .context("connect setup")?
-        .await
-        .context("handshake")?;
-
-    // ----- authenticate once on the control stream -----
-    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open ctrl bi")?;
-    let mut exporter = [0u8; EXPORTER_LEN];
-    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
-        .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
 
     // v0.5 M16.5: profile-driven sizing takes precedence over bucket
     // padding (its candidate sizes serve as pad_buckets; profile_dist
@@ -194,11 +193,71 @@ pub async fn connect(cfg: ClientConfig) -> Result<RunningClient> {
         None
     };
 
-    let req = AuthRequest::sign(&cfg.identity.client_id, &sk, &exporter)?;
+    connect_inner(ConnectParams {
+        server_addr: cfg.server.addr,
+        sni: cfg.server.sni,
+        cert_sha256: cfg.server.cert_sha256,
+        client_id: cfg.identity.client_id,
+        sk,
+        socks5_listen: cfg.socks5.listen,
+        pad_buckets,
+        jitter,
+        profile_dist,
+    })
+    .await
+}
+
+/// Dial from a `proteus://…` subscription blob (one-click import), with
+/// the SOCKS5 listener on `socks5_listen`. Shaping defaults off (the
+/// blob carries only the credential + endpoint for now).
+pub async fn connect_subscription(url: &str, socks5_listen: SocketAddr) -> Result<RunningClient> {
+    let sub = Subscription::from_url(url)?;
+    let sk = parse_signing_key_b64(&sub.private_key_b64)?;
+    let server_addr: SocketAddr = sub.server_addr.parse().with_context(|| {
+        format!(
+            "subscription server_addr {:?} is not host:port",
+            sub.server_addr
+        )
+    })?;
+    connect_inner(ConnectParams {
+        server_addr,
+        sni: sub.sni,
+        cert_sha256: sub.cert_sha256,
+        client_id: sub.client_id,
+        sk,
+        socks5_listen,
+        pad_buckets: None,
+        jitter: None,
+        profile_dist: None,
+    })
+    .await
+}
+
+async fn connect_inner(p: ConnectParams) -> Result<RunningClient> {
+    tls::install_crypto_provider();
+    let qcfg = tls::client_config(&p.cert_sha256)?;
+
+    let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let mut endpoint = quinn::Endpoint::client(local).context("bind client UDP")?;
+    endpoint.set_default_client_config(qcfg);
+
+    let conn = endpoint
+        .connect(p.server_addr, &p.sni)
+        .context("connect setup")?
+        .await
+        .context("handshake")?;
+
+    // ----- authenticate once on the control stream -----
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.context("open ctrl bi")?;
+    let mut exporter = [0u8; EXPORTER_LEN];
+    conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
+        .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
+
+    let req = AuthRequest::sign(&p.client_id, &p.sk, &exporter)?;
     write_frame_maybe_padded(
         &mut ctrl_send,
         &Frame::new(FrameType::AuthRequest, req.encode()?)?,
-        pad_buckets.as_deref().map(|v| v.as_slice()),
+        p.pad_buckets.as_deref().map(|v| v.as_slice()),
     )
     .await
     .context("write AUTH_REQUEST")?;
@@ -223,15 +282,15 @@ pub async fn connect(cfg: ClientConfig) -> Result<RunningClient> {
     let conn = Arc::new(conn);
     let shaping = Shaping {
         session_key,
-        pad_buckets,
-        jitter,
-        profile_dist,
+        pad_buckets: p.pad_buckets,
+        jitter: p.jitter,
+        profile_dist: p.profile_dist,
     };
 
     // ----- SOCKS5 listener + accept loop -----
-    let listener = TcpListener::bind(cfg.socks5.listen)
+    let listener = TcpListener::bind(p.socks5_listen)
         .await
-        .with_context(|| format!("bind SOCKS5 {}", cfg.socks5.listen))?;
+        .with_context(|| format!("bind SOCKS5 {}", p.socks5_listen))?;
     let socks5_addr = listener.local_addr().context("socks5 local_addr")?;
 
     let accept_conn = conn.clone();

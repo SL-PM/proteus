@@ -15,4 +15,5 @@ pub mod policy;
 pub mod proxy;
 pub mod ratelimit;
 pub mod replay;
+pub mod subscription;
 pub mod tls;

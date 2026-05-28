@@ -17,7 +17,8 @@ use std::{collections::HashMap, path::Path};
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use bytes::{BufMut, Bytes, BytesMut};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+// `SigningKey` comes from the `pub use` below (re-exported for client-core).
 use rand::{RngCore, rngs::OsRng};
 
 pub const EXPORTER_LABEL: &[u8] = b"EXPORTER-PROTEUS-v0.3";
@@ -234,18 +235,29 @@ pub fn parse_public_key_b64(s: &str) -> Result<VerifyingKey> {
     VerifyingKey::from_bytes(&arr).context("invalid Ed25519 public key")
 }
 
-/// Load a base64-encoded 32-byte Ed25519 private key from disk (as
-/// written by `proteus-tools keygen`).
-pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("read private key {}", path.display()))?;
-    let bytes = B64.decode(body.trim()).context("private key not base64")?;
+/// Re-exported so downstream crates (client-core) can name the key type
+/// without depending on `ed25519-dalek` directly.
+pub use ed25519_dalek::SigningKey;
+
+/// Parse a base64-encoded 32-byte Ed25519 private key (the form
+/// `proteus-tools keygen` writes and the panel returns once). Used for
+/// inline keys carried in a subscription blob.
+pub fn parse_signing_key_b64(s: &str) -> Result<SigningKey> {
+    let bytes = B64.decode(s.trim()).context("private key not base64")?;
     if bytes.len() != 32 {
         bail!("private key must be 32 bytes (got {})", bytes.len());
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(SigningKey::from_bytes(&arr))
+}
+
+/// Load a base64-encoded 32-byte Ed25519 private key from disk (as
+/// written by `proteus-tools keygen`).
+pub fn load_signing_key(path: &Path) -> Result<SigningKey> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read private key {}", path.display()))?;
+    parse_signing_key_b64(&body)
 }
 
 // ---------- tests ----------
