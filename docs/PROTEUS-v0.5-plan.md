@@ -216,10 +216,21 @@ When all true → v0.5-rc.1 taggable:
 | M5.5 | Sign-off: wire-distribution evidence + [`m5.5-padding-signoff.md`](m5.5-padding-signoff.md) ✅ | small |
 
 **v0.5-rc.1 = M0.5 through M5.5, all complete.** Profile-driven
-sampling + timing jitter (rc.2) and SNI rotation / port hopping
-(rc.2 / v0.6) remain deferred per §3.
+sampling (rc.2) and SNI rotation / port hopping (rc.2 / v0.6) remain
+deferred per §3.
 
 Total: ~5 commits, ~1-2 sessions for a complete rc.1.
+
+### v0.5-rc.2 milestones (timing jitter)
+
+Design in §11. Closes the *timing* half of A7 (the size half waits on
+profile-driven sampling).
+
+| | Milestone | Effort |
+|---|---|---|
+| M6.5 | `proteus_core::jitter` module (bounded delay sampler) + `TimingJitterConfig` + this design | small |
+| M7.5 | Wire-up: apply jitter on the proxy-stream send path (server + client bridges) | small |
+| M8.5 | Tests (sampler bounds + data round-trips with jitter on) + sign-off doc | small |
 
 ## 7. Migration impact
 
@@ -238,7 +249,7 @@ wire-compatible. Mitigation:
 ## 8. Out-of-scope (still deferred beyond v0.5-rc.1)
 
 * Profile-driven size sampling (uses `fingerprint-profile.example.yaml`).
-* Inter-arrival timing jitter.
+* ~~Inter-arrival timing jitter~~ — **now in scope for rc.2, see §11.**
 * SNI rotation.
 * Port hopping.
 * Periodic per-stream re-keying.
@@ -270,3 +281,100 @@ v1.0
 * [`m14-comparison-report.md`](m14-comparison-report.md) — v0.3 wire baseline (14 packets vs 41 for real H3).
 * [`m9.4-rc1-signoff.md`](m9.4-rc1-signoff.md) — v0.4 sign-off, §2.6 + §3 document what v0.5 inherits.
 * [`THREAT-MODEL-v0.3.md`](THREAT-MODEL-v0.3.md) — A1–A11 framework (still accurate for v0.4/v0.5; only the per-adversary status moves).
+
+---
+
+## 11. v0.5-rc.2 addendum: timing jitter
+
+rc.1 quantized *frame sizes*. rc.2 attacks the other axis a statistical
+analyst (A7) keys on: **inter-arrival timing**. Right now PROTEUS
+writes each frame the instant the bridge produces it, so the gaps
+between frames directly mirror the application's data-production
+timing plus RTT — a low-jitter, deterministic signature.
+
+### 11.1 Mechanism
+
+A **bounded random delay before each outgoing proxy-stream frame**.
+The sender sleeps a sampled duration, then writes the frame.
+
+The single most important property: **timing jitter is sender-side
+only.** The receiver decodes frames exactly as before — there is **no
+wire-format change, no flag, no lockstep upgrade**. Each side may
+enable jitter independently. This is strictly simpler than bucket
+padding (which needed the `FLAG_PADDED` bit + both ends in agreement).
+
+### 11.2 Distribution
+
+rc.2 first cut: **uniform** delay in `[min_ms, max_ms]`. Uniform is
+trivially testable (every sample provably within bounds) and good
+enough to break the *deterministic* send pattern.
+
+It is explicitly **not** a mimic of any real cover host's
+inter-arrival distribution — that needs the same recorded-profile
+machinery deferred for size sampling (§3). Exponential / profile-driven
+inter-arrival is a later increment. This mirrors how rc.1 bucket
+padding was "a quantizer, not a mimic": rc.2 jitter is "a
+decorrelator, not a mimic."
+
+### 11.3 Scope
+
+* **Proxy-stream frames, both directions.** Server→client and
+  client→server DATA/control-on-proxy-stream frames go through the
+  jitter delay when enabled.
+* **NOT auth-stream frames.** Auth is a one-shot handshake; delaying
+  it just adds login latency with negligible fingerprint benefit (a
+  single AUTH_REQUEST has no inter-arrival pattern to hide).
+* **Idle PINGs** (M3.5) already have their own interval timer; jitter
+  does not stack on top of them.
+
+### 11.4 The throughput trade-off (honest)
+
+Per-frame delay is **not free**. A uniform `[min_ms, max_ms]` delay
+adds an average of `(min+max)/2` ms of latency *per frame*. On a bulk
+transfer split into many ~1500-byte frames, throughput is capped at
+roughly `frame_size / avg_delay`:
+
+| avg delay | rough bulk-throughput ceiling |
+|---:|---|
+| 1 ms | ~1.5 MB/s |
+| 5 ms | ~300 KB/s |
+| 20 ms | ~75 KB/s |
+
+So the default range is kept **small** (`min_ms: 0`, `max_ms: 5`), and
+the config docs warn that larger ranges trade throughput for timing
+decorrelation. An operator who only proxies interactive / low-volume
+traffic can afford a wider range; a bulk-download use case cannot.
+
+A smarter design (token-bucket pacer that only jitters frame
+*boundaries* without serializing every write, or coalescing small
+frames) is future work — noted in the sign-off, not built in rc.2.
+
+### 11.5 Configuration (additive YAML, default off)
+
+```yaml
+# v0.5-rc.2. Sender-side only — set independently per side (no lockstep).
+timing_jitter:
+  enabled: true
+  min_ms: 0
+  max_ms: 5      # uniform delay [min_ms, max_ms] before each proxy-stream frame
+```
+
+When `enabled: false` (default), the send path is byte-for-byte and
+timing-identical to rc.1.
+
+### 11.6 Acceptance criteria for rc.2
+
+1. `proteus_core::jitter` module: a sampler that, given
+   `(min_ms, max_ms)`, returns a `Duration` provably in range.
+   Unit tests over many samples + edge cases (`min == max`,
+   `min == max == 0`).
+2. `TimingJitterConfig` in `proteus_core::config`, default off,
+   validated (`min_ms <= max_ms`).
+3. Send path applies the delay on proxy-stream frames (server +
+   client) when enabled; disabled = no delay, no behavior change.
+4. Integration test: data round-trips correctly through the SOCKS5
+   proxy with jitter enabled (proves the delay doesn't break the
+   bridge or desync AEAD counters). A no-jitter control.
+5. Sign-off doc `m8.5-timing-jitter-signoff.md` with the honest
+   throughput-cost statement + what remains for profile-driven
+   timing.

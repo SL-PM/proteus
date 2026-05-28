@@ -36,6 +36,9 @@ pub struct ServerConfig {
     /// v0.5 M3.5: server-side idle dummy traffic.
     #[serde(default)]
     pub idle_padding: IdlePaddingConfig,
+    /// v0.5-rc.2 M6.5: inter-arrival timing jitter on the send path.
+    #[serde(default)]
+    pub timing_jitter: TimingJitterConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -145,6 +148,60 @@ impl Default for IdlePaddingConfig {
     }
 }
 
+/// v0.5-rc.2 M6.5: inter-arrival timing jitter. A bounded random delay
+/// is applied before each outgoing proxy-stream frame, decorrelating
+/// PROTEUS's send timing from the application's data-production timing.
+///
+/// Sender-side only — there is NO wire-format change and NO lockstep
+/// requirement. Each end may enable this independently. See
+/// [`PROTEUS-v0.5-plan.md`](../../../docs/PROTEUS-v0.5-plan.md) §11.
+///
+/// The cost is throughput: a uniform `[min_ms, max_ms]` delay adds an
+/// average of `(min+max)/2` ms of latency per frame. Keep the range
+/// small for bulk traffic; widen it only for low-volume/interactive use.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TimingJitterConfig {
+    /// Master switch. Default false = no delay, behave like rc.1.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Lower bound of the uniform delay in milliseconds. Default 0.
+    #[serde(default)]
+    pub min_ms: u64,
+    /// Upper bound of the uniform delay in milliseconds. Default 5.
+    #[serde(default = "default_jitter_max_ms")]
+    pub max_ms: u64,
+}
+
+fn default_jitter_max_ms() -> u64 {
+    5
+}
+
+impl Default for TimingJitterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_ms: 0,
+            max_ms: default_jitter_max_ms(),
+        }
+    }
+}
+
+impl TimingJitterConfig {
+    /// Validate the range. Returns an error if `min_ms > max_ms` so a
+    /// misconfigured deployment fails loudly at startup rather than
+    /// silently swapping the bounds.
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled && self.min_ms > self.max_ms {
+            anyhow::bail!(
+                "timing_jitter.min_ms ({}) must be <= max_ms ({})",
+                self.min_ms,
+                self.max_ms
+            );
+        }
+        Ok(())
+    }
+}
+
 impl ServerConfig {
     pub fn from_yaml_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -164,6 +221,9 @@ pub struct ClientConfig {
     /// v0.5 M1.5+: bucket padding for outgoing frames.
     #[serde(default)]
     pub padding: PaddingConfig,
+    /// v0.5-rc.2 M6.5: inter-arrival timing jitter on the send path.
+    #[serde(default)]
+    pub timing_jitter: TimingJitterConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }

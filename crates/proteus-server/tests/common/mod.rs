@@ -20,7 +20,10 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use proteus_core::{
     aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN},
-    config::{IdlePaddingConfig, ListenConfig, PaddingConfig, PolicyConfig, ServerConfig},
+    config::{
+        IdlePaddingConfig, ListenConfig, PaddingConfig, PolicyConfig, ServerConfig,
+        TimingJitterConfig,
+    },
     frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     proxy::ProxyOpen,
     tls,
@@ -50,25 +53,50 @@ impl TestServer {
             client_id,
             PaddingConfig::default(),
             IdlePaddingConfig::default(),
+            TimingJitterConfig::default(),
         )
         .await
     }
 
     /// Start with v0.5 bucket padding enabled, using the default
-    /// bucket set. Idle padding stays off.
+    /// bucket set. Idle padding + jitter stay off.
     pub async fn start_padded(client_id: &str) -> Result<Self> {
         let padding = PaddingConfig {
             enabled: true,
             buckets: Vec::new(), // → DEFAULT_BUCKETS
         };
-        Self::start_with(client_id, padding, IdlePaddingConfig::default()).await
+        Self::start_with(
+            client_id,
+            padding,
+            IdlePaddingConfig::default(),
+            TimingJitterConfig::default(),
+        )
+        .await
     }
 
-    /// Full-control constructor: explicit padding + idle-padding config.
+    /// Start with v0.5-rc.2 timing jitter enabled over `[min_ms, max_ms]`.
+    /// Padding + idle padding stay off.
+    pub async fn start_jittered(client_id: &str, min_ms: u64, max_ms: u64) -> Result<Self> {
+        let jitter = TimingJitterConfig {
+            enabled: true,
+            min_ms,
+            max_ms,
+        };
+        Self::start_with(
+            client_id,
+            PaddingConfig::default(),
+            IdlePaddingConfig::default(),
+            jitter,
+        )
+        .await
+    }
+
+    /// Full-control constructor: explicit padding + idle-padding + jitter.
     pub async fn start_with(
         client_id: &str,
         padding: PaddingConfig,
         idle_padding: IdlePaddingConfig,
+        timing_jitter: TimingJitterConfig,
     ) -> Result<Self> {
         let mut csprng = OsRng;
         let sk = SigningKey::generate(&mut csprng);
@@ -92,6 +120,7 @@ impl TestServer {
             decoy: None,
             padding,
             idle_padding,
+            timing_jitter,
             log_level: "info".to_string(),
         };
 

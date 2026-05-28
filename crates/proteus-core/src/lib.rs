@@ -7,6 +7,7 @@ pub mod auth;
 pub mod config;
 pub mod decoy;
 pub mod frame;
+pub mod jitter;
 pub mod metrics;
 pub mod padding;
 pub mod policy;
