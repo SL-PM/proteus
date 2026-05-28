@@ -4,6 +4,41 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.5.1] — 2026-05-28
+
+Token-bucket burst allowance for the send-path timing jitter. A
+latency refinement of v0.5.0's jitter — backward-compatible, default
+off. Sign-off:
+[`docs/m10.5-pacer-signoff.md`](docs/m10.5-pacer-signoff.md).
+
+* **`Pacer` (M9.5).** A stateful token bucket with time-based refill.
+  `timing_jitter.burst` (default 0) sets the free-send allowance:
+  `0` = per-frame jitter (v0.5.0 behavior, unchanged); `N` = the first
+  `N` queued frames send with zero added delay, then sustained traffic
+  is paced, and the allowance refills over idle time. Capacity 0
+  reduces *exactly* to per-frame jitter, so the default changes
+  nothing. Deterministic unit tests (injectable clock + RNG).
+* **Wire-up (M10.5).** Both bridges build a per-stream `Pacer`;
+  `JitterPlan { jitter, burst }` replaces the bare `Jitter` on the
+  bridge boundary. Threaded through server + client; idle PINGs still
+  excluded. Server banner + `jitter_summary()` report the burst.
+* **Honest correction.** The rc.2 sign-off implied a pacer cuts the
+  throughput cost. It cuts *latency* for bursty/interactive traffic but
+  does **not** raise the *sustained* bulk ceiling — any time-spacing
+  rate-limits to ~`frame_size / mean_interval`. The
+  `sustained_rate_is_bounded_by_mean` unit test pins this.
+
+No threat-model change: the pacer is an operability/latency knob, not a
+new anti-fingerprinting mechanism (a large `burst` even leaves short
+flows un-shaped — size it small if that matters).
+
+159 tests pass (+6 since v0.5.0). fmt + clippy -D warnings clean.
+
+### Commits since v0.5.0
+
+* `39d819d` feat(m9.5): token-bucket pacer for timing jitter
+* `e5b0abd` feat(m10.5): wire token-bucket pacer into the send path + sign-off
+
 ## [v0.5.0] — 2026-05-28
 
 **Wire-pattern decorrelation complete.** No code changes vs.

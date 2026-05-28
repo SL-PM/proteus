@@ -1,11 +1,12 @@
 # PROTEUS
 
-> **Status: v0.5.0 working research prototype.**
+> **Status: v0.5.1 working research prototype.**
 > v0.4 (Approach C) added inner AEAD wire wrapping, TLS 1.3 0-RTT,
 > QUIC connection migration, and a high-fidelity H3 decoy. v0.5 adds
 > **wire-pattern decorrelation**: per-frame bucket-padding + idle dummy
-> traffic (rc.1), and send-path timing jitter (rc.2). Both are opt-in
-> and default off.
+> traffic (rc.1), send-path timing jitter (rc.2), and a token-bucket
+> burst allowance that keeps interactive traffic snappy (v0.5.1). All
+> opt-in, default off.
 
 ## What this is
 
@@ -203,9 +204,11 @@ Full milestone matrix:
 | M6.5 | `proteus_core::jitter` sampler + `TimingJitterConfig` | ✅ |
 | M7.5 | Wire-up: jitter on the proxy-stream send path | ✅ |
 | M8.5 | Jitter integration test + sign-off (rc.2) | ✅ |
+| M9.5 | `Pacer` token bucket + `burst` config | ✅ |
+| M10.5 | Wire pacer into bridges + burst test + sign-off (v0.5.1) | ✅ |
 
-Deferred beyond rc.2: profile-driven size + inter-arrival sampling
-(needs a capture corpus), token-bucket pacer, SNI rotation, port
+Deferred: profile-driven size + inter-arrival sampling (the real A7
+closer — needs a capture corpus), frame coalescing, SNI rotation, port
 hopping. Matrix:
 [`docs/PROTEUS-v0.5-plan.md`](docs/PROTEUS-v0.5-plan.md) §6.
 
@@ -226,6 +229,7 @@ hopping. Matrix:
 | [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md) | v0.4-rc.1 acceptance evidence |
 | [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md) | v0.5-rc.1 acceptance evidence (padding) |
 | [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md) | v0.5-rc.2 acceptance evidence (jitter) |
+| [`docs/m10.5-pacer-signoff.md`](docs/m10.5-pacer-signoff.md) | v0.5.1 acceptance evidence (token-bucket pacer) |
 | [`docs/m14-comparison-report.md`](docs/m14-comparison-report.md) | v0.3 wire fingerprint baseline |
 | [`docs/spike-m19-pq.md`](docs/spike-m19-pq.md) | Post-quantum feasibility for v1.0 |
 | [`docs/fingerprint-profile.example.yaml`](docs/fingerprint-profile.example.yaml) | M16 schema for v0.5-rc.2 profile sampling |
@@ -251,7 +255,7 @@ hopping. Matrix:
 
 ```sh
 cargo build --workspace
-cargo test  --workspace        # 153 tests (124 core + 5 server-lib + 14 tools + 10 server-integration)
+cargo test  --workspace        # 159 tests (129 core + 5 server-lib + 14 tools + 11 server-integration)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
