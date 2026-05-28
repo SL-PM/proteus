@@ -1727,10 +1727,25 @@ name = "proteus-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bytes",
  "clap",
+ "proteus-client-core",
  "proteus-core",
+ "tokio",
+]
+
+[[package]]
+name = "proteus-client-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "ed25519-dalek",
+ "proteus-core",
+ "proteus-server",
  "quinn",
+ "rand 0.8.6",
+ "tempfile",
  "tokio",
 ]
 

@@ -4,6 +4,7 @@ members = [
     "crates/proteus-core",
     "crates/proteus-server",
     "crates/proteus-client",
+    "crates/proteus-client-core",
     "crates/proteus-tools",
     "crates/proteus-panel",
 ]

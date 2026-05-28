@@ -1,0 +1,23 @@
+[package]
+name = "proteus-client-core"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# v0.6 client app: the PROTEUS client engine as a library, so both the
+# CLI (proteus-client) and the GUI (Tauri desktop, later mobile) drive
+# the same connect/auth/SOCKS5 + live-stats core.
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+proteus-core = { path = "../proteus-core" }
+quinn = "0.11"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+proteus-server = { path = "../proteus-server" }
+rand = "0.8"
+tempfile = "3"
