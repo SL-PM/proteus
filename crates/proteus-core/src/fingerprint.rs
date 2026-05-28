@@ -96,6 +96,29 @@ impl Distribution {
         // Clamp to [0,1] to absorb floating-point drift.
         tv.clamp(0.0, 1.0)
     }
+
+    /// Draw one sample from this distribution by inverse-CDF sampling
+    /// (M14.5). Returns `None` for an empty distribution. Used to
+    /// prototype *profile-driven* shaping: instead of rounding a frame
+    /// size up to a fixed bucket, draw a target size from a recorded
+    /// cover-host size histogram so the emitted distribution *matches*
+    /// the cover rather than collapsing to a few spikes.
+    pub fn sample<R: rand::Rng>(&self, rng: &mut R) -> Option<u64> {
+        if self.bins.is_empty() {
+            return None;
+        }
+        let r: f64 = rng.gen_range(0.0..1.0); // [0, 1)
+        let mut cum = 0.0;
+        for (&k, &p) in &self.bins {
+            cum += p;
+            if r < cum {
+                return Some(k);
+            }
+        }
+        // Floating-point cumulative may fall a hair short of 1.0; the
+        // last bin catches the remainder.
+        self.bins.keys().next_back().copied()
+    }
 }
 
 /// Best accuracy any binary classifier can achieve separating two
@@ -188,5 +211,40 @@ mod tests {
     fn optimal_accuracy_clamps() {
         assert!(approx(optimal_classifier_accuracy(-0.3), 0.5)); // garbage in → floor
         assert!(approx(optimal_classifier_accuracy(2.0), 1.0)); // garbage in → ceil
+    }
+
+    #[test]
+    fn sample_empty_is_none() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0);
+        let d = Distribution::from_samples(std::iter::empty::<u64>());
+        assert_eq!(d.sample(&mut rng), None);
+    }
+
+    #[test]
+    fn sampling_reproduces_the_distribution() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(0x5A11_71E5);
+        // A non-uniform source over a few values.
+        let src = Distribution::from_samples([1u64, 1, 1, 1, 2, 2, 3, 9, 9, 9]);
+        // Draw many samples and rebuild — should closely match the source.
+        let drawn: Vec<u64> = (0..40_000).filter_map(|_| src.sample(&mut rng)).collect();
+        let resampled = Distribution::from_samples(drawn);
+        let tv = src.total_variation(&resampled);
+        assert!(
+            tv < 0.02,
+            "inverse-CDF sampling should reproduce src; TV={tv}"
+        );
+    }
+
+    #[test]
+    fn sample_only_emits_keys_with_mass() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(7);
+        let d = Distribution::from_samples([5u64, 5, 100, 100, 100]);
+        for _ in 0..1000 {
+            let s = d.sample(&mut rng).unwrap();
+            assert!(s == 5 || s == 100, "sampled an unsupported key: {s}");
+        }
     }
 }

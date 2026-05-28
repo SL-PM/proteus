@@ -236,11 +236,20 @@ profile-driven sampling).
 | M11.5 | `proteus_core::fingerprint` — TV-distance / best-classifier-accuracy math ✅ | small |
 | M12.5 | Size-axis measurement harness + [`m12.5-fingerprint-eval-signoff.md`](m12.5-fingerprint-eval-signoff.md) ✅ | small |
 | M13.5 | Timing-axis measurement (jitter on a regular cadence) — folded into the M12.5 sign-off ✅ | small |
+| M14.5 | Profile-sampling feasibility: `Distribution::sample` + harness measurement (does sampling beat bucketing against a cover?) ✅ | small |
 
 **v0.5-rc.2 = M6.5 through M8.5.** M9.5–M10.5 (token-bucket pacer,
-→ v0.5.1) refine the jitter's latency cost. Profile-driven size +
-inter-arrival sampling (needs a capture corpus) — the real A7 closer —
-remains deferred.
+→ v0.5.1) refine the jitter's latency cost. M11.5–M14.5 build the
+measurement harness and use it to validate the *next* mechanism before
+committing to it (→ v0.5.2 + follow-on test bumps).
+
+**M14.5 result:** drawing target sizes from a cover histogram
+(`Distribution::sample`) matches the cover far better than bucket
+quantization — the feasibility result that justifies the (deferred,
+data-dependent) full profile-driven wire integration. What remains for
+that integration: a real capture corpus / profile-loader, and the send
+path picking a sampled target size then padding/fragmenting to it
+(fragmentation is the hard part — you can pad up but not shrink).
 
 ## 7. Migration impact
 

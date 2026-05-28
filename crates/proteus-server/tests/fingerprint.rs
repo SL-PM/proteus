@@ -252,3 +252,91 @@ fn jitter_destroys_a_regular_timing_signature() {
         "mean cadence should be ~preserved: off={m_off:.2} on={m_on:.2}"
     );
 }
+
+/// M14.5 — profile-sampling feasibility. The measurements above pinned
+/// the documented LIMIT of bucket-padding: a 5-bucket quantizer leaves
+/// a 5-spike size distribution that a cover host's smooth histogram
+/// does not have, so across-bucket activities stay distinguishable.
+///
+/// This asks the question that decides whether the (big, data-dependent)
+/// profile-driven-sampling wire integration is worth building:
+///
+///   **If we instead drew each frame's target wire size from the cover
+///   host's recorded size histogram, would the emitted distribution
+///   actually match the cover — i.e. beat bucketing?**
+///
+/// We answer it with the harness, no wire changes: take a synthetic
+/// cover size histogram, produce (a) bucket-padded sizes (round each
+/// cover draw UP to the nearest PROTEUS bucket) and (b) profile-sampled
+/// sizes (draw directly from the cover via `Distribution::sample`), and
+/// compare each back to the cover by total-variation distance.
+///
+/// Pure + deterministic (seeded RNG, no live server).
+#[test]
+fn profile_sampling_beats_bucketing_against_a_cover() {
+    use proteus_core::padding::{DEFAULT_BUCKETS, pick_bucket};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    let mut rng = StdRng::seed_from_u64(0x00C0_FFEE_5125);
+
+    // A synthetic but plausible cover size histogram (bytes): lots of
+    // small frames, a medium hump, a near-MTU tail — the smooth shape
+    // bucketing cannot reproduce.
+    let mut cover_samples: Vec<u64> = Vec::new();
+    for (size, weight) in [
+        (40u64, 30),
+        (80, 22),
+        (140, 14),
+        (300, 10),
+        (520, 8),
+        (760, 6),
+        (1040, 5),
+        (1280, 3),
+        (1420, 2),
+    ] {
+        cover_samples.extend(std::iter::repeat_n(size, weight));
+    }
+    let cover = Distribution::from_samples(cover_samples.iter().copied());
+
+    // (a) Bucket-padded: each cover draw rounded UP to the nearest
+    // PROTEUS bucket {128,256,512,1024,1500}. Collapses to ≤5 spikes.
+    let bucketed: Vec<u64> = cover_samples
+        .iter()
+        .map(|&s| pick_bucket(s as usize, DEFAULT_BUCKETS).unwrap_or(1500) as u64)
+        .collect();
+    let bucketed_dist = Distribution::from_samples(bucketed);
+    let tv_bucketed = bucketed_dist.total_variation(&cover);
+
+    // (b) Profile-sampled: draw target sizes straight from the cover
+    // histogram (the mechanism a profile-driven shaper would use).
+    let sampled: Vec<u64> = (0..40_000).filter_map(|_| cover.sample(&mut rng)).collect();
+    let sampled_dist = Distribution::from_samples(sampled);
+    let tv_sampled = sampled_dist.total_variation(&cover);
+
+    eprintln!("--- M14.5 profile-sampling vs bucketing (TV to cover) ---");
+    eprintln!(
+        "  bucket-padded : TV={tv_bucketed:.3}  (5-spike quantization, {} bins)",
+        bucketed_dist.distinct_bins()
+    );
+    eprintln!(
+        "  profile-sampled: TV={tv_sampled:.3}  ({} bins, matches cover)",
+        sampled_dist.distinct_bins()
+    );
+
+    // Bucketing leaves a large gap to the cover (quantization spikes).
+    assert!(
+        tv_bucketed > 0.4,
+        "bucketing should differ markedly from the smooth cover; TV={tv_bucketed:.3}"
+    );
+    // Profile-sampling closely matches the cover.
+    assert!(
+        tv_sampled < 0.05,
+        "profile-sampling should match the cover; TV={tv_sampled:.3}"
+    );
+    // And it beats bucketing by a wide margin — the result that
+    // justifies building the full profile-driven wire integration.
+    assert!(
+        tv_sampled < tv_bucketed,
+        "profile-sampling must beat bucketing: sampled={tv_sampled:.3} bucketed={tv_bucketed:.3}"
+    );
+}
