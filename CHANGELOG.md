@@ -4,6 +4,51 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.5.0-rc.1] — 2026-05-28
+
+Wire-pattern padding. Reduces the v0.4 connection-envelope
+fingerprint with two opt-in mechanisms (both default off, so v0.4
+deployments are unaffected). Design + sign-off:
+[`docs/PROTEUS-v0.5-plan.md`](docs/PROTEUS-v0.5-plan.md),
+[`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md).
+
+**Highlights:**
+
+* **Bucket-padding (M1.5 + M2.5).** Every PROTEUS frame's on-wire
+  `payload_len` is rounded up to one of `{128, 256, 512, 1024, 1500}`
+  bytes via a new `proteus_core::padding` module + `FLAG_PADDED`
+  protocol bit. Padding lives inside the AEAD-sealed block for
+  proxy-stream frames; `read_frame` / `read_frame_aead` auto-strip it.
+  Wired through server, client, and udp-test via
+  `write_frame_*_maybe_padded`. Config: `padding.enabled` +
+  `padding.buckets` (both ends, lockstep).
+* **Idle dummy traffic (M3.5, server-only).** Bridge send loops emit
+  a padded PING after a configurable quiet interval; receive loops
+  skip inbound PINGs. Eliminates the "idle = silence" tell. Config:
+  `idle_padding.{enabled, interval_secs, bucket}`.
+* **Wire-distribution test (M4.5).** `tests/padding.rs` reads
+  server→client frames at the raw QUIC level and asserts ≥95% land on
+  a bucket (observed 100%: 5/100/300/1000-byte payloads →
+  128/128/512/1024). A padding-off control confirms the change is real.
+
+**Known limitations (deferred to v0.5-rc.2):** the 5-bucket
+quantization still differs from a real cover host's smooth size
+distribution; timing is unchanged; idle PINGs are fixed-rate/size.
+Profile-driven sampling (the `fingerprint-profile.yaml` schema is
+ready) + timing jitter close A7 in rc.2. `proteus/0.3` ALPN remains
+distinctive (v1.0).
+
+146 tests pass (+25 since v0.4.0). fmt + clippy -D warnings clean.
+
+### Commits since v0.4.0
+
+* `3c802dc` docs(m0.5): PROTEUS-v0.5-plan.md — bucket-padding + idle dummies design
+* `231a8b8` feat(m1.5): proteus_core::padding — bucket-rounding + FLAG_PADDED protocol
+* `367f3c6` feat(m2.5): wire bucket-padding through server + client + udp-test
+* `c59a11e` feat(m3.5): server-side idle dummy traffic (constant-rate PING padding)
+* `1fb558c` test(m4.5): integration test for wire-level bucket distribution
+* `2c51ade` docs(m5.5): v0.5-rc.1 sign-off — bucket padding wire-verified
+
 ## [v0.4.0] — 2026-05-27
 
 **Approach C complete.** No code changes vs. v0.4.0-rc.2; this is
