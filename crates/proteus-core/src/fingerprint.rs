@@ -119,6 +119,32 @@ impl Distribution {
         // last bin catches the remainder.
         self.bins.keys().next_back().copied()
     }
+
+    /// Draw a sample conditioned on the key being `>= min` (M15.5).
+    /// Returns `None` if no bin has key `>= min`.
+    ///
+    /// This is the sampler profile-driven *padding* needs: a frame can
+    /// only be padded UP, never shrunk, so the target wire size must be
+    /// `>= real_payload + trailer`. We therefore sample from the cover
+    /// distribution restricted to (and renormalized over) the bins that
+    /// are large enough to hold the payload.
+    pub fn sample_ge<R: rand::Rng>(&self, min: u64, rng: &mut R) -> Option<u64> {
+        // Total mass of the eligible (key >= min) bins.
+        let total: f64 = self.bins.range(min..).map(|(_, &p)| p).sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let r: f64 = rng.gen_range(0.0..total); // renormalize over eligible mass
+        let mut cum = 0.0;
+        for (&k, &p) in self.bins.range(min..) {
+            cum += p;
+            if r < cum {
+                return Some(k);
+            }
+        }
+        // FP remainder → the largest eligible bin.
+        self.bins.range(min..).next_back().map(|(&k, _)| k)
+    }
 }
 
 /// Best accuracy any binary classifier can achieve separating two
@@ -246,5 +272,57 @@ mod tests {
             let s = d.sample(&mut rng).unwrap();
             assert!(s == 5 || s == 100, "sampled an unsupported key: {s}");
         }
+    }
+
+    #[test]
+    fn sample_ge_respects_the_lower_bound() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(11);
+        let d = Distribution::from_samples([10u64, 50, 100, 200, 500]);
+        for _ in 0..5000 {
+            let s = d.sample_ge(100, &mut rng).unwrap();
+            assert!(s >= 100, "sample_ge(100) returned {s}");
+        }
+    }
+
+    #[test]
+    fn sample_ge_none_when_nothing_fits() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(12);
+        let d = Distribution::from_samples([10u64, 20, 30]);
+        assert_eq!(d.sample_ge(31, &mut rng), None);
+        assert_eq!(d.sample_ge(1000, &mut rng), None);
+    }
+
+    #[test]
+    fn sample_ge_zero_min_matches_full_sample() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(13);
+        let d = Distribution::from_samples([1u64, 1, 2, 3, 3, 3]);
+        // Over many draws, sample_ge(0) reproduces the full distribution.
+        let drawn: Vec<u64> = (0..40_000)
+            .filter_map(|_| d.sample_ge(0, &mut rng))
+            .collect();
+        let resampled = Distribution::from_samples(drawn);
+        assert!(d.total_variation(&resampled) < 0.02);
+    }
+
+    #[test]
+    fn sample_ge_reproduces_the_conditional_distribution() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let mut rng = StdRng::seed_from_u64(14);
+        // Bins below 100 should be excluded; the >=100 subset is
+        // {100: 2/4, 300: 1/4, 500: 1/4} after renormalization.
+        let d = Distribution::from_samples([10u64, 50, 100, 100, 300, 500]);
+        let drawn: Vec<u64> = (0..60_000)
+            .filter_map(|_| d.sample_ge(100, &mut rng))
+            .collect();
+        let got = Distribution::from_samples(drawn);
+        let expected = Distribution::from_samples([100u64, 100, 300, 500]);
+        assert!(
+            got.total_variation(&expected) < 0.02,
+            "TV={}",
+            got.total_variation(&expected)
+        );
     }
 }

@@ -39,6 +39,10 @@ pub struct ServerConfig {
     /// v0.5-rc.2 M6.5: inter-arrival timing jitter on the send path.
     #[serde(default)]
     pub timing_jitter: TimingJitterConfig,
+    /// v0.5 M15.5: profile-driven size padding (takes precedence over
+    /// `padding` when enabled).
+    #[serde(default)]
+    pub profile_padding: ProfilePaddingConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -211,6 +215,55 @@ impl TimingJitterConfig {
     }
 }
 
+/// v0.5 M15.5: profile-driven size padding. Instead of rounding each
+/// frame up to a fixed bucket, the sender draws a target wire size from
+/// this weighted size histogram (a stand-in for a recorded cover-host
+/// size distribution) and pads up to it — so the emitted size
+/// distribution *matches* the profile rather than collapsing to a few
+/// bucket spikes. M14.5 measured this beats bucketing (TV 1.000 →
+/// 0.005 against a synthetic cover).
+///
+/// When enabled, takes precedence over `padding` (bucket) for sizing.
+/// Padding can only pad UP, so a frame whose payload exceeds every
+/// profile size falls back to bucket padding until fragmentation lands
+/// (deferred). Default off.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ProfilePaddingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Weighted target wire `payload_len` sizes (bytes). Each entry's
+    /// `weight` is its relative frequency in the sampling distribution.
+    #[serde(default)]
+    pub sizes: Vec<ProfileSize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProfileSize {
+    pub size: usize,
+    pub weight: u32,
+}
+
+impl ProfilePaddingConfig {
+    /// Reject an enabled-but-useless config (no positive-weight sizes)
+    /// at startup rather than silently doing nothing.
+    pub fn validate(&self) -> Result<()> {
+        if self.enabled && self.sizes.iter().all(|s| s.weight == 0) {
+            anyhow::bail!("profile_padding enabled but no sizes with weight > 0");
+        }
+        Ok(())
+    }
+
+    /// Build the sampling distribution by expanding the weighted sizes.
+    /// Returns an empty distribution when disabled or weightless.
+    pub fn to_distribution(&self) -> crate::fingerprint::Distribution {
+        let samples = self
+            .sizes
+            .iter()
+            .flat_map(|s| std::iter::repeat_n(s.size as u64, s.weight as usize));
+        crate::fingerprint::Distribution::from_samples(samples)
+    }
+}
+
 impl ServerConfig {
     pub fn from_yaml_file(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
@@ -233,6 +286,9 @@ pub struct ClientConfig {
     /// v0.5-rc.2 M6.5: inter-arrival timing jitter on the send path.
     #[serde(default)]
     pub timing_jitter: TimingJitterConfig,
+    /// v0.5 M15.5: profile-driven size padding.
+    #[serde(default)]
+    pub profile_padding: ProfilePaddingConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -313,5 +369,48 @@ mod tests {
         let bad = "log_level: debug\n";
         let err = serde_yaml::from_str::<ServerConfig>(bad).unwrap_err();
         assert!(err.to_string().contains("listen"), "got: {err}");
+    }
+
+    #[test]
+    fn profile_padding_default_is_off() {
+        let cfg = ProfilePaddingConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.sizes.is_empty());
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.to_distribution().count(), 0);
+    }
+
+    #[test]
+    fn profile_padding_to_distribution_expands_weights() {
+        let cfg = ProfilePaddingConfig {
+            enabled: true,
+            sizes: vec![
+                ProfileSize {
+                    size: 128,
+                    weight: 3,
+                },
+                ProfileSize {
+                    size: 512,
+                    weight: 1,
+                },
+            ],
+        };
+        assert!(cfg.validate().is_ok());
+        let d = cfg.to_distribution();
+        assert_eq!(d.count(), 4); // 3 + 1
+        assert!((d.mass(128) - 0.75).abs() < 1e-9);
+        assert!((d.mass(512) - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn profile_padding_enabled_without_weights_is_rejected() {
+        let cfg = ProfilePaddingConfig {
+            enabled: true,
+            sizes: vec![ProfileSize {
+                size: 128,
+                weight: 0,
+            }],
+        };
+        assert!(cfg.validate().is_err());
     }
 }

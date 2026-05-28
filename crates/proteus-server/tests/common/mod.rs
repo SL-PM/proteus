@@ -133,6 +133,7 @@ impl TestServer {
             padding,
             idle_padding,
             timing_jitter,
+            profile_padding: proteus_core::config::ProfilePaddingConfig::default(),
             log_level: "info".to_string(),
         };
 
