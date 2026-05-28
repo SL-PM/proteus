@@ -17,7 +17,7 @@ use sqlx::{
 };
 
 /// One managed PROTEUS client (= one sellable access).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, FromRow, serde::Serialize)]
 pub struct Client {
     /// PROTEUS `client_id`.
     pub id: String,

@@ -7,5 +7,6 @@
 //!
 //! Design + roadmap: `docs/PROTEUS-v0.6-control-plan.md`.
 
+pub mod api;
 pub mod auth;
 pub mod db;

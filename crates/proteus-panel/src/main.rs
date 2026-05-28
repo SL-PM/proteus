@@ -7,9 +7,8 @@
 //! The management API, admin web UI, QR/subscription, quotas and
 //! commerce land incrementally — see `docs/PROTEUS-v0.6-control-plan.md`.
 
-use axum::{Router, routing::get};
 use clap::{Parser, Subcommand};
-use proteus_panel::{auth, db};
+use proteus_panel::{api, auth, db};
 
 /// Default bind address for the panel. HTTPS/TLS termination (on the
 /// firewall-opened 443/8443) is wired in a later milestone; for now it
@@ -77,10 +76,6 @@ async fn serve(store: db::Db, db_path: &str) -> anyhow::Result<()> {
     let n_clients = store.count().await?;
     let n_admins = store.admin_count().await?;
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/", get(index));
-
     let bind = std::env::var("PROTEUS_PANEL_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     println!("proteus-panel v{} (M2.6)", env!("CARGO_PKG_VERSION"));
@@ -89,18 +84,9 @@ async fn serve(store: db::Db, db_path: &str) -> anyhow::Result<()> {
         eprintln!("warning: no admin configured — run `proteus-panel set-admin <user>`");
     }
     println!("listening on: http://{bind}");
-    println!("routes: GET /health, GET /");
-    // `store` becomes axum state for the management API in the next M2.6 step.
+    println!("routes: /health, /, POST /api/login|logout, /api/clients[/:id[/enable|disable]]");
+
+    let app = api::router(api::AppState::new(store));
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-/// Liveness probe.
-async fn health() -> &'static str {
-    "ok"
-}
-
-/// Placeholder root until the admin UI lands (M4.6).
-async fn index() -> &'static str {
-    "PROTEUS Control — management portal. See docs/PROTEUS-v0.6-control-plan.md"
 }
