@@ -90,7 +90,19 @@ async fn main() -> Result<()> {
     let mut exporter = [0u8; EXPORTER_LEN];
     conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
         .map_err(|e| anyhow::anyhow!("exporter: {e:?}"))?;
-    let pad_buckets: Option<Arc<Vec<usize>>> = if cfg.padding.enabled {
+    // v0.5 M16.5: profile-driven sizing takes precedence over bucket
+    // padding (its candidate sizes serve as pad_buckets for buf +
+    // fallback; profile_dist carries the sampling weights).
+    cfg.profile_padding.validate()?;
+    let profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>> =
+        if cfg.profile_padding.enabled {
+            Some(Arc::new(cfg.profile_padding.to_distribution()))
+        } else {
+            None
+        };
+    let pad_buckets: Option<Arc<Vec<usize>>> = if cfg.profile_padding.enabled {
+        Some(Arc::new(cfg.profile_padding.candidate_sizes()))
+    } else if cfg.padding.enabled {
         Some(Arc::new(cfg.padding.effective_buckets().to_vec()))
     } else {
         None
@@ -149,8 +161,11 @@ async fn main() -> Result<()> {
         let conn = conn.clone();
         let session_key = session_key.clone();
         let pad_buckets = pad_buckets.clone();
+        let profile_dist = profile_dist.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(sock, conn, session_key, pad_buckets, jitter).await {
+            if let Err(e) =
+                handle_socks5(sock, conn, session_key, pad_buckets, jitter, profile_dist).await
+            {
                 eprintln!("socks5 {peer}: {e:#}");
             }
         });
@@ -163,6 +178,7 @@ async fn handle_socks5(
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
     jitter: Option<proteus_core::jitter::JitterPlan>,
+    profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     // ----- Greeting: [ver, nmethods, methods...] -----
@@ -270,8 +286,9 @@ async fn handle_socks5(
     // ----- Bridge SOCKS5 socket ↔ QUIC proxy stream -----
     let (tcp_r, tcp_w) = sock.into_split();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    let bridge_profile = profile_dist.as_deref().cloned();
     // Idle padding is server-only in v0.5-rc.1; client passes None.
-    // Timing jitter (M7.5) IS applied client-side on the send path.
+    // Timing jitter (M7.5) + profile sizing (M16.5) ARE applied client-side.
     proxy::bridge_quic_tcp(
         q_send,
         q_recv,
@@ -282,6 +299,7 @@ async fn handle_socks5(
         bridge_buckets,
         None,
         jitter,
+        bridge_profile,
     )
     .await
 }

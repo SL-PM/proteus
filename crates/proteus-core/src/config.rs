@@ -262,6 +262,22 @@ impl ProfilePaddingConfig {
             .flat_map(|s| std::iter::repeat_n(s.size as u64, s.weight as usize));
         crate::fingerprint::Distribution::from_samples(samples)
     }
+
+    /// Distinct candidate sizes with positive weight, ascending. Used as
+    /// the bridge's `wire_buckets` when profile padding is active — they
+    /// size the read buffer and serve as the fallback when a payload is
+    /// too large for any profile size.
+    pub fn candidate_sizes(&self) -> Vec<usize> {
+        let mut sizes: Vec<usize> = self
+            .sizes
+            .iter()
+            .filter(|s| s.weight > 0)
+            .map(|s| s.size)
+            .collect();
+        sizes.sort_unstable();
+        sizes.dedup();
+        sizes
+    }
 }
 
 impl ServerConfig {

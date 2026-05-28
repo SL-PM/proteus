@@ -106,6 +106,11 @@ struct ServerState {
     /// delay before each outgoing proxy-stream DATA frame. `None` = no
     /// timing jitter (send timing identical to rc.1).
     jitter: Option<proteus_core::jitter::JitterPlan>,
+    /// v0.5 M16.5: when `Some`, outgoing DATA frames are sized by
+    /// sampling this profile distribution (takes precedence over
+    /// `padding_buckets`, which then holds the profile's candidate sizes
+    /// for buffer sizing + fallback). `None` = bucket padding or none.
+    profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -166,8 +171,23 @@ impl Server {
             .map(|p| DecoyHeaders::from_json_file(p).map(Arc::new))
             .transpose()?;
 
-        // v0.5 M2.5: bucket-padding for outgoing frames.
-        let padding_buckets: Option<Arc<Vec<usize>>> = if cfg.padding.enabled {
+        // v0.5 M16.5: profile-driven sizing takes precedence over bucket
+        // padding. When enabled, the profile's candidate sizes also serve
+        // as `padding_buckets` (read-buffer sizing + the too-large-payload
+        // fallback), and `profile_dist` carries the sampling weights.
+        cfg.profile_padding.validate()?;
+        let profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>> =
+            if cfg.profile_padding.enabled {
+                Some(Arc::new(cfg.profile_padding.to_distribution()))
+            } else {
+                None
+            };
+
+        // v0.5 M2.5: bucket-padding for outgoing frames (or, under profile
+        // padding, the profile's candidate sizes for buf + fallback).
+        let padding_buckets: Option<Arc<Vec<usize>>> = if cfg.profile_padding.enabled {
+            Some(Arc::new(cfg.profile_padding.candidate_sizes()))
+        } else if cfg.padding.enabled {
             Some(Arc::new(cfg.padding.effective_buckets().to_vec()))
         } else {
             None
@@ -214,6 +234,7 @@ impl Server {
                 padding_buckets,
                 idle_pad,
                 jitter,
+                profile_dist,
             },
         })
     }
@@ -495,6 +516,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
         let padding_buckets = state.padding_buckets.clone();
         let idle_pad = state.idle_pad.clone();
         let jitter = state.jitter;
+        let profile_dist = state.profile_dist.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_proxy_stream(
                 q_send,
@@ -505,6 +527,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
                 padding_buckets,
                 idle_pad,
                 jitter,
+                profile_dist,
             )
             .await
             {
@@ -540,6 +563,7 @@ async fn handle_proxy_stream(
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
     jitter: Option<proteus_core::jitter::JitterPlan>,
+    profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>>,
 ) -> Result<()> {
     // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
     // post-auth. Derive this stream's key + (send, recv) pair from the
@@ -592,6 +616,7 @@ async fn handle_proxy_stream(
                 padding_buckets,
                 idle_pad,
                 jitter,
+                profile_dist,
             )
             .await
         }
@@ -609,6 +634,7 @@ async fn handle_proxy_stream(
                 padding_buckets,
                 idle_pad,
                 jitter,
+                profile_dist,
             )
             .await
         }
@@ -670,6 +696,7 @@ async fn proxy_to_tcp(
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
     jitter: Option<proteus_core::jitter::JitterPlan>,
+    profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -734,6 +761,7 @@ async fn proxy_to_tcp(
     metrics.proxy_tcp_opened_inc();
     let (tcp_r, tcp_w) = tcp.into_split();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    let bridge_profile = profile_dist.as_deref().cloned();
     proxy::bridge_quic_tcp(
         q_send,
         q_recv,
@@ -744,6 +772,7 @@ async fn proxy_to_tcp(
         bridge_buckets,
         idle_pad,
         jitter,
+        bridge_profile,
     )
     .await
 }
@@ -762,6 +791,7 @@ async fn proxy_to_udp(
     padding_buckets: Option<Arc<Vec<usize>>>,
     idle_pad: Option<proxy::IdlePad>,
     jitter: Option<proteus_core::jitter::JitterPlan>,
+    profile_dist: Option<Arc<proteus_core::fingerprint::Distribution>>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -837,6 +867,7 @@ async fn proxy_to_udp(
 
     metrics.proxy_udp_opened_inc();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    let bridge_profile = profile_dist.as_deref().cloned();
     proxy::bridge_quic_udp(
         q_send,
         q_recv,
@@ -846,6 +877,7 @@ async fn proxy_to_udp(
         bridge_buckets,
         idle_pad,
         jitter,
+        bridge_profile,
     )
     .await
 }

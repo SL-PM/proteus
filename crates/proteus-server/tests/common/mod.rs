@@ -21,8 +21,8 @@ use proteus_core::{
     aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN},
     config::{
-        IdlePaddingConfig, ListenConfig, PaddingConfig, PolicyConfig, ServerConfig,
-        TimingJitterConfig,
+        IdlePaddingConfig, ListenConfig, PaddingConfig, PolicyConfig, ProfilePaddingConfig,
+        ProfileSize, ServerConfig, TimingJitterConfig,
     },
     frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     proxy::ProxyOpen,
@@ -54,6 +54,7 @@ impl TestServer {
             PaddingConfig::default(),
             IdlePaddingConfig::default(),
             TimingJitterConfig::default(),
+            ProfilePaddingConfig::default(),
         )
         .await
     }
@@ -70,6 +71,27 @@ impl TestServer {
             padding,
             IdlePaddingConfig::default(),
             TimingJitterConfig::default(),
+            ProfilePaddingConfig::default(),
+        )
+        .await
+    }
+
+    /// Start with v0.5 M16.5 profile-driven sizing over the given
+    /// weighted `(size, weight)` set. Bucket padding / jitter stay off.
+    pub async fn start_profiled(client_id: &str, sizes: &[(usize, u32)]) -> Result<Self> {
+        let profile = ProfilePaddingConfig {
+            enabled: true,
+            sizes: sizes
+                .iter()
+                .map(|&(size, weight)| ProfileSize { size, weight })
+                .collect(),
+        };
+        Self::start_with(
+            client_id,
+            PaddingConfig::default(),
+            IdlePaddingConfig::default(),
+            TimingJitterConfig::default(),
+            profile,
         )
         .await
     }
@@ -99,16 +121,19 @@ impl TestServer {
             PaddingConfig::default(),
             IdlePaddingConfig::default(),
             jitter,
+            ProfilePaddingConfig::default(),
         )
         .await
     }
 
-    /// Full-control constructor: explicit padding + idle-padding + jitter.
+    /// Full-control constructor: explicit padding + idle-padding +
+    /// jitter + profile padding.
     pub async fn start_with(
         client_id: &str,
         padding: PaddingConfig,
         idle_padding: IdlePaddingConfig,
         timing_jitter: TimingJitterConfig,
+        profile_padding: ProfilePaddingConfig,
     ) -> Result<Self> {
         let mut csprng = OsRng;
         let sk = SigningKey::generate(&mut csprng);
@@ -133,7 +158,7 @@ impl TestServer {
             padding,
             idle_padding,
             timing_jitter,
-            profile_padding: proteus_core::config::ProfilePaddingConfig::default(),
+            profile_padding,
             log_level: "info".to_string(),
         };
 

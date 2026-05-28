@@ -131,6 +131,23 @@ pub fn bridge_buf_size(buckets: Option<&[usize]>) -> usize {
     }
 }
 
+/// v0.5 M16.5: per-DATA-frame profile-driven target size. When a
+/// `profile` size distribution is supplied, sample a single target wire
+/// `payload_len` `>= payload_len + PAD_TRAILER_LEN` from it (returned as
+/// a one-element bucket set so the existing `pick_bucket` / `pad_frame`
+/// path pads to exactly that size). Returns `None` when there's no
+/// profile, or the profile has no size large enough — in both cases the
+/// caller falls back to its static `wire_buckets`.
+fn profile_target(
+    payload_len: usize,
+    profile: Option<&crate::fingerprint::Distribution>,
+    rng: &mut impl rand::Rng,
+) -> Option<Vec<usize>> {
+    let dist = profile?;
+    let min = (payload_len + crate::padding::PAD_TRAILER_LEN) as u64;
+    dist.sample_ge(min, rng).map(|t| vec![t as usize])
+}
+
 /// Runtime idle-padding parameters for the server's send-to-client
 /// direction (v0.5 M3.5). When supplied to a bridge, the send loop
 /// emits one dummy PING frame after `interval` of stream-quiet time,
@@ -182,6 +199,7 @@ pub async fn bridge_quic_tcp<R, W>(
     wire_buckets: Option<Vec<usize>>,
     idle: Option<IdlePad>,
     jitter: Option<crate::jitter::JitterPlan>,
+    profile: Option<crate::fingerprint::Distribution>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -243,13 +261,16 @@ where
                             tokio::time::sleep(d).await;
                         }
                     }
-                    write_frame_aead_maybe_padded(
-                        &mut q_send,
-                        &frame,
-                        &mut aead_send,
-                        wire_buckets.as_deref(),
-                    )
-                    .await?;
+                    // v0.5 M16.5: profile-driven sizing. When a profile is
+                    // set, sample one target >= payload+trailer; on a miss
+                    // (or no profile) fall through to wire_buckets. The
+                    // thread RNG is created + dropped within this sync
+                    // statement so the bridge future stays `Send`.
+                    let prof_target =
+                        profile_target(n, profile.as_ref(), &mut rand::thread_rng());
+                    let targets = prof_target.as_deref().or(wire_buckets.as_deref());
+                    write_frame_aead_maybe_padded(&mut q_send, &frame, &mut aead_send, targets)
+                        .await?;
                     last_activity = Instant::now();
                 }
                 _ = idle_tick => {
@@ -316,6 +337,7 @@ pub async fn bridge_quic_udp(
     wire_buckets: Option<Vec<usize>>,
     idle: Option<IdlePad>,
     jitter: Option<crate::jitter::JitterPlan>,
+    profile: Option<crate::fingerprint::Distribution>,
 ) -> anyhow::Result<()> {
     use std::{sync::Arc, time::Duration, time::Instant};
 
@@ -384,13 +406,14 @@ pub async fn bridge_quic_udp(
                             tokio::time::sleep(d).await;
                         }
                     }
-                    write_frame_aead_maybe_padded(
-                        &mut q_send,
-                        &frame,
-                        &mut aead_send,
-                        wire_buckets.as_deref(),
-                    )
-                    .await?;
+                    // v0.5 M16.5: profile-driven sizing (fall back to
+                    // buckets). RNG created + dropped in this sync
+                    // statement so the bridge future stays `Send`.
+                    let prof_target =
+                        profile_target(n, profile.as_ref(), &mut rand::thread_rng());
+                    let targets = prof_target.as_deref().or(wire_buckets.as_deref());
+                    write_frame_aead_maybe_padded(&mut q_send, &frame, &mut aead_send, targets)
+                        .await?;
                     last_activity = Instant::now();
                 }
                 _ = idle_tick => {

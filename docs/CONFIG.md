@@ -68,6 +68,18 @@ timing_jitter:
   min_ms: 0
   max_ms: 5            # uniform delay [min_ms, max_ms] before each proxy-stream frame
   burst: 0             # v0.5.1 token bucket: free sends before pacing (0 = per-frame)
+
+# Optional — v0.5 M16.5. Profile-driven size padding. Instead of bucket
+# rounding, sample each frame's target wire size from this weighted
+# histogram (a stand-in for a recorded cover-host size distribution).
+# Takes precedence over `padding` when enabled. Set the same on both
+# ends (like padding — receivers auto-strip, but sizes must be agreed).
+profile_padding:
+  enabled: true
+  sizes:               # weighted target wire payload_len values (bytes)
+    - { size: 200, weight: 30 }
+    - { size: 440, weight: 14 }
+    - { size: 900, weight: 6 }
 ```
 
 > **v0.5 timing-jitter note:** unlike padding, jitter needs NO wire
@@ -89,6 +101,17 @@ timing_jitter:
 > deployment is unaffected; flip it on **both** server and client in
 > lockstep. See [`PROTEUS-v0.5-plan.md`](PROTEUS-v0.5-plan.md) §7 and
 > [`m5.5-padding-signoff.md`](m5.5-padding-signoff.md).
+
+> **`profile_padding` (v0.5 M16.5):** samples each frame's wire size
+> from the weighted `sizes` histogram instead of bucket-rounding, so the
+> emitted size distribution *matches* the profile rather than collapsing
+> to a few bucket spikes. Takes precedence over `padding`. **Limit:**
+> padding only grows a frame, so a payload larger than every profile
+> size falls back to bucket-like sizing until fragmentation lands — it's
+> faithful for interactive/small traffic, degrades to bucketing for
+> bulk. The profile here is synthetic; meaningful tarnung needs a
+> profile from a real capture. See
+> [`m16.5-profile-padding-signoff.md`](m16.5-profile-padding-signoff.md).
 
 ---
 

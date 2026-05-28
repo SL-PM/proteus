@@ -237,6 +237,9 @@ profile-driven sampling).
 | M12.5 | Size-axis measurement harness + [`m12.5-fingerprint-eval-signoff.md`](m12.5-fingerprint-eval-signoff.md) ✅ | small |
 | M13.5 | Timing-axis measurement (jitter on a regular cadence) — folded into the M12.5 sign-off ✅ | small |
 | M14.5 | Profile-sampling feasibility: `Distribution::sample` + harness measurement (does sampling beat bucketing against a cover?) ✅ | small |
+| M15.5 | Profile-padding core: `Distribution::sample_ge` + `ProfilePaddingConfig` ✅ | small |
+| M16.5 | Profile-padding wired end-to-end (server + client bridges) + [`m16.5-profile-padding-signoff.md`](m16.5-profile-padding-signoff.md) ✅ | medium |
+| M17.5 | Fragmentation: split large payloads to hit small profile sizes (the pad-up-only limit) | ⏳ deferred |
 
 **v0.5-rc.2 = M6.5 through M8.5.** M9.5–M10.5 (token-bucket pacer,
 → v0.5.1) refine the jitter's latency cost. M11.5–M14.5 build the

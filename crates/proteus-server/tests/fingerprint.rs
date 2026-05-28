@@ -30,7 +30,7 @@ use common::{TestServer, make_client_endpoint, open_tcp_proxy, read_raw_wire_fra
 use proteus_core::{
     aead::ProxyStreamAead,
     fingerprint::{Distribution, optimal_classifier_accuracy},
-    frame::{Frame, FrameType, write_frame_aead},
+    frame::{Frame, FrameType, read_frame_aead, write_frame_aead},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -339,4 +339,86 @@ fn profile_sampling_beats_bucketing_against_a_cover() {
         tv_sampled < tv_bucketed,
         "profile-sampling must beat bucketing: sampled={tv_sampled:.3} bucketed={tv_bucketed:.3}"
     );
+}
+
+/// M16.5 — profile padding wired END-TO-END. The M14.5 measurement was
+/// offline (the sampler vs. a synthetic cover). This drives a real
+/// profiled server and reads the server→client frames at the raw QUIC
+/// level: every wire `payload_len` must be a *profile* size, and
+/// crucially NOT a default bucket — proving profile sizing (not
+/// bucketing) is the active mechanism on the live send path.
+#[tokio::test]
+async fn profile_padding_sizes_live_frames_from_the_profile() -> Result<()> {
+    let echo_port = spawn_tcp_echo().await;
+    // Profile sizes deliberately disjoint from the default buckets
+    // {128,256,512,1024,1500} so observing them is unambiguous.
+    const PROFILE: [u64; 3] = [200, 440, 900];
+    const DEFAULT_BUCKETS: [u64; 5] = [128, 256, 512, 1024, 1500];
+    let server = TestServer::start_profiled("alice", &[(200, 1), (440, 1), (900, 1)]).await?;
+
+    // 50-byte payloads fit under every profile size, so each echo frame
+    // is sized by sampling the profile.
+    let sizes = workload(&server, echo_port, 50).await?;
+    assert!(!sizes.is_empty(), "no frames observed");
+
+    let distinct: std::collections::BTreeSet<u64> = sizes.iter().copied().collect();
+    eprintln!("--- M16.5 live profile-padding wire sizes: {distinct:?} ---");
+
+    for &s in &sizes {
+        assert!(
+            PROFILE.contains(&s),
+            "wire size {s} is not a profile size {PROFILE:?}"
+        );
+        assert!(
+            !DEFAULT_BUCKETS.contains(&s),
+            "wire size {s} is a default bucket — profile sizing not active"
+        );
+    }
+    Ok(())
+}
+
+/// M16.5 — profile padding must not break the AEAD round-trip. Reads
+/// the echo back through the AEAD layer (not raw) and checks the bytes
+/// survive the sample-a-target-then-pad path intact.
+#[tokio::test]
+async fn profile_padded_data_round_trips() -> Result<()> {
+    let echo_port = spawn_tcp_echo().await;
+    let server = TestServer::start_profiled("alice", &[(256, 1), (700, 1), (1300, 1)]).await?;
+
+    let endpoint = make_client_endpoint(&server.cert_sha256)?;
+    let conn = endpoint.connect(server.addr, "localhost")?.await?;
+    let session_key = run_auth(&conn, &server.client_id, &server.signing_key).await?;
+    let (mut q_send, mut q_recv, mut sa, stream_id) =
+        open_tcp_proxy(&conn, &session_key, "127.0.0.1", echo_port).await?;
+
+    let payload: Vec<u8> = (0..600u32).map(|i| (i % 251) as u8).collect();
+    let data = Frame {
+        frame_type: FrameType::Data,
+        flags: 0,
+        stream_id,
+        payload: bytes::Bytes::from(payload.clone()),
+    };
+    write_frame_aead(&mut q_send, &data, &mut sa.send).await?;
+
+    // Reassemble until we've recovered the full echoed payload.
+    let mut got = Vec::new();
+    while got.len() < payload.len() {
+        let echo = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_frame_aead(&mut q_recv, &mut sa.recv),
+        )
+        .await
+        .map_err(|_| anyhow!("timeout waiting for profiled echo"))??;
+        if echo.frame_type == FrameType::Data {
+            got.extend_from_slice(&echo.payload);
+        }
+    }
+    assert_eq!(
+        got, payload,
+        "payload corrupted through profile-padding path"
+    );
+
+    conn.close(0u32.into(), b"test done");
+    endpoint.wait_idle().await;
+    Ok(())
 }
