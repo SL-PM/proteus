@@ -1,0 +1,15 @@
+[package]
+name = "proteus-panel"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# v0.6 "Control" — management portal for PROTEUS. M0.6 is the scaffold:
+# an axum app with a /health endpoint. DB (sqlx/SQLite), auth, and the
+# management API land in M1.6+.
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+proteus-core = { path = "../proteus-core" }
+tokio = { version = "1", features = ["full"] }

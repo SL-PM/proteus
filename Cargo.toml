@@ -5,6 +5,7 @@ members = [
     "crates/proteus-server",
     "crates/proteus-client",
     "crates/proteus-tools",
+    "crates/proteus-panel",
 ]
 
 [workspace.package]
