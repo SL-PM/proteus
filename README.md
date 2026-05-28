@@ -1,12 +1,12 @@
 # PROTEUS
 
-> **Status: v0.5.1 working research prototype.**
+> **Status: v0.5.2 working research prototype.**
 > v0.4 (Approach C) added inner AEAD wire wrapping, TLS 1.3 0-RTT,
 > QUIC connection migration, and a high-fidelity H3 decoy. v0.5 adds
-> **wire-pattern decorrelation**: per-frame bucket-padding + idle dummy
-> traffic (rc.1), send-path timing jitter (rc.2), and a token-bucket
-> burst allowance that keeps interactive traffic snappy (v0.5.1). All
-> opt-in, default off.
+> **wire-pattern decorrelation**: bucket-padding + idle dummies (rc.1),
+> timing jitter (rc.2), a token-bucket burst allowance (v0.5.1), and a
+> **measurement harness** that quantifies the effect (v0.5.2). All
+> shaping is opt-in, default off.
 
 ## What this is
 
@@ -206,6 +206,14 @@ Full milestone matrix:
 | M8.5 | Jitter integration test + sign-off (rc.2) | ✅ |
 | M9.5 | `Pacer` token bucket + `burst` config | ✅ |
 | M10.5 | Wire pacer into bridges + burst test + sign-off (v0.5.1) | ✅ |
+| M11.5 | `proteus_core::fingerprint` — TV-distance / best-classifier accuracy | ✅ |
+| M12.5 | Measurement harness + sign-off (v0.5.2) | ✅ |
+
+**Measured (M12.5):** bucket-padding drives the best-possible
+classifier accuracy for telling two fine-grained activities apart from
+`1.000` (5B vs 100B → wire 21 vs 116) down to `0.500` — a coin flip —
+when both pad to the same 128-byte bucket. Across buckets (128 vs 1024)
+it honestly stays `1.000`: padding is a quantizer, not a uniformizer.
 
 Deferred: profile-driven size + inter-arrival sampling (the real A7
 closer — needs a capture corpus), frame coalescing, SNI rotation, port
@@ -230,6 +238,7 @@ hopping. Matrix:
 | [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md) | v0.5-rc.1 acceptance evidence (padding) |
 | [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md) | v0.5-rc.2 acceptance evidence (jitter) |
 | [`docs/m10.5-pacer-signoff.md`](docs/m10.5-pacer-signoff.md) | v0.5.1 acceptance evidence (token-bucket pacer) |
+| [`docs/m12.5-fingerprint-eval-signoff.md`](docs/m12.5-fingerprint-eval-signoff.md) | v0.5.2 fingerprint-measurement results |
 | [`docs/m14-comparison-report.md`](docs/m14-comparison-report.md) | v0.3 wire fingerprint baseline |
 | [`docs/spike-m19-pq.md`](docs/spike-m19-pq.md) | Post-quantum feasibility for v1.0 |
 | [`docs/fingerprint-profile.example.yaml`](docs/fingerprint-profile.example.yaml) | M16 schema for v0.5-rc.2 profile sampling |
@@ -255,7 +264,7 @@ hopping. Matrix:
 
 ```sh
 cargo build --workspace
-cargo test  --workspace        # 159 tests (129 core + 5 server-lib + 14 tools + 11 server-integration)
+cargo test  --workspace        # 168 tests (137 core + 5 server-lib + 14 tools + 12 server-integration)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -263,8 +272,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Architecture (one paragraph)
 
 `proteus-core` is the shared library: `aead`, `auth`, `config`,
-`decoy`, `frame`, `jitter`, `metrics`, `padding`, `policy`, `proxy`,
-`ratelimit`, `replay`, `tls`. `proteus-server` is now a library + thin bin — the library
+`decoy`, `fingerprint`, `frame`, `jitter`, `metrics`, `padding`,
+`policy`, `proxy`, `ratelimit`, `replay`, `tls`. `proteus-server` is now a library + thin bin — the library
 crate (`proteus_server::Server`) exposes `bind/run/shutdown/metrics`
 for in-process integration tests; the bin parses CLI args and prints
 the startup banner. `proteus-client` is a SOCKS5 CONNECT daemon

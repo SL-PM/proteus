@@ -4,6 +4,39 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.5.2] — 2026-05-28
+
+Fingerprint-measurement harness. Turns the v0.5 shaping work's "we
+think this helps" into a measured number. Analysis + tests only — no
+runtime or protocol change. Sign-off:
+[`docs/m12.5-fingerprint-eval-signoff.md`](docs/m12.5-fingerprint-eval-signoff.md).
+
+* **`proteus_core::fingerprint` (M11.5).** Pure, deterministic math:
+  `Distribution` + total-variation distance + `optimal_classifier_accuracy`
+  `= (1+TV)/2`. TV=0 → indistinguishable (acc 0.5); TV=1 → trivially
+  distinguishable (acc 1.0). No training, no corpus, fully testable.
+* **Harness (M12.5).** `tests/fingerprint.rs` drives real in-process
+  flows, records raw server→client wire `payload_len`, and measures
+  whether an observer can tell two PROTEUS activities apart by size:
+  - small (5B) vs mid (100B), padding **off** → wire 21 vs 116 →
+    best-classifier acc **1.000** (distinguishable).
+  - same pair, padding **on** → both 128 → acc **0.500** (coin flip,
+    the fine-grained size leak is closed).
+  - small vs large (1000B), padding on → 128 vs 1024 → acc **1.000**
+    (across-bucket — padding is a quantizer, not a uniformizer; the
+    test asserts this limit too, so we don't overclaim).
+
+Deferred (in sign-off): PROTEUS-vs-real-H3 (needs profiles + a corpus),
+the timing axis (size-only here — deterministic), and real-classifier
+numbers (TV is the theoretical optimum = conservative upper bound).
+
+168 tests pass (+9 since v0.5.1). fmt + clippy -D warnings clean.
+
+### Commits since v0.5.1
+
+* `1e2de17` feat(m11.5): proteus_core::fingerprint — distinguishability measurement
+* `274c337` test(m12.5): fingerprint-measurement harness — padding effect quantified
+
 ## [v0.5.1] — 2026-05-28
 
 Token-bucket burst allowance for the send-path timing jitter. A
