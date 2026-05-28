@@ -4,6 +4,38 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.5.0] — 2026-05-28
+
+**Wire-pattern decorrelation complete.** No code changes vs.
+v0.5.0-rc.2; this stabilizes the two RCs (padding + jitter) into a
+release after no follow-up issues, the same way v0.4.0 settled
+v0.4.0-rc.1/rc.2.
+
+What v0.5.0 delivers on top of v0.4.0, all opt-in and default off:
+
+* **Bucket-padding** (M1.5–M2.5): every frame's on-wire `payload_len`
+  rounds up to one of `{128, 256, 512, 1024, 1500}`. Per-frame size
+  leak closed. Padding lives inside the AEAD-sealed block.
+* **Idle dummy traffic** (M3.5, server-only): padded PING after a
+  configurable quiet interval — idle streams aren't betrayed by
+  silence.
+* **Send-path timing jitter** (M6.5–M7.5): bounded uniform delay
+  before each outgoing DATA frame, sender-side only (no wire change,
+  no lockstep). Breaks the deterministic send-timing signature.
+* Sign-offs: [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md)
+  (size axis) + [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md)
+  (timing axis).
+
+Honest scope: both mechanisms *decorrelate* but neither *matches* a
+real cover host's distribution — a distribution-modelling A7 attacker
+can still distinguish PROTEUS. Fully closing A7 needs profile-driven
+size + inter-arrival sampling (the `fingerprint-profile.yaml` schema is
+ready; the matching engine + a capture corpus are not). `proteus/0.3`
+ALPN remains distinctive (v1.0). A token-bucket pacer (lower jitter
+overhead) is future work.
+
+153 tests pass. fmt + clippy -D warnings clean.
+
 ## [v0.5.0-rc.2] — 2026-05-28
 
 Send-path timing jitter. Attacks the *timing* axis of A7 that rc.1's

@@ -1,11 +1,11 @@
 # PROTEUS
 
-> **Status: v0.5.0-rc.2 working research prototype.**
+> **Status: v0.5.0 working research prototype.**
 > v0.4 (Approach C) added inner AEAD wire wrapping, TLS 1.3 0-RTT,
-> QUIC connection migration, and a high-fidelity H3 decoy. v0.5-rc.1
-> added **wire-pattern padding** (per-frame bucket-padding + idle
-> dummy traffic). v0.5-rc.2 adds **send-path timing jitter** —
-> decorrelating PROTEUS's inter-arrival timing from the application's.
+> QUIC connection migration, and a high-fidelity H3 decoy. v0.5 adds
+> **wire-pattern decorrelation**: per-frame bucket-padding + idle dummy
+> traffic (rc.1), and send-path timing jitter (rc.2). Both are opt-in
+> and default off.
 
 ## What this is
 
@@ -21,18 +21,21 @@ exporter-bound Ed25519 client auth.
 - **v0.4 design + sign-off:**
   [`docs/PROTEUS-v0.4-plan.md`](docs/PROTEUS-v0.4-plan.md) +
   [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md).
-- **v0.5 design + sign-off:**
+- **v0.5 design + sign-offs:**
   [`docs/PROTEUS-v0.5-plan.md`](docs/PROTEUS-v0.5-plan.md) +
-  [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md).
+  [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md) (padding) +
+  [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md) (jitter).
 
 ## ⚠️ Not a production tool
 
 v0.5 is **still DPI-detectable by design** at the connection envelope
 (distinctive `proteus/0.3` ALPN; bucket-padding quantizes frame sizes
-to 5 values but the distribution shape + timing still differ from a
-real cover host). True ALPN unification + REALITY-style upstream relay
-is v1.0 work; profile-driven size sampling + timing jitter are v0.5-rc.2.
-Do not deploy as a circumvention tool in any adversarial environment.
+to 5 values and timing jitter is uniform — both *decorrelate* but
+neither *matches* a real cover host's distribution). True ALPN
+unification + REALITY-style upstream relay is v1.0 work; profile-driven
+size + inter-arrival sampling (fully closing A7) needs a capture corpus
+and is deferred. Do not deploy as a circumvention tool in any
+adversarial environment.
 See [`docs/THREAT-MODEL-v0.3.md`](docs/THREAT-MODEL-v0.3.md) for the
 full statement (still accurate for v0.4 — same threat model, more
 hardening inside the tunnel).
