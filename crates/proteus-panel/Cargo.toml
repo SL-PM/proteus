@@ -10,7 +10,9 @@ license = "AGPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
+argon2 = "0.5"
 axum = "0.7"
+clap = { version = "4", features = ["derive"] }
 proteus-core = { path = "../proteus-core" }
 # M1.6: SQLite client store. Runtime query API (no compile-time DATABASE_URL
 # needed); SQLite is local so no TLS feature.

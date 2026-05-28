@@ -71,6 +71,15 @@ CREATE TABLE IF NOT EXISTS clients (
     created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );";
 
+/// Admin credentials for the management panel (M2.6). Single-admin to
+/// start; multi-admin / roles can be layered on later.
+const SCHEMA_ADMINS: &str = "\
+CREATE TABLE IF NOT EXISTS admins (
+    username    TEXT PRIMARY KEY,
+    argon2_hash TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);";
+
 /// Handle to the SQLite-backed client store.
 #[derive(Clone)]
 pub struct Db {
@@ -92,7 +101,11 @@ impl Db {
         sqlx::query(SCHEMA)
             .execute(&pool)
             .await
-            .context("apply schema")?;
+            .context("apply clients schema")?;
+        sqlx::query(SCHEMA_ADMINS)
+            .execute(&pool)
+            .await
+            .context("apply admins schema")?;
         Ok(Self { pool })
     }
 
@@ -198,6 +211,37 @@ impl Db {
             .context("count clients")?;
         Ok(n)
     }
+
+    /// Create or replace the admin credential (stores an argon2 hash).
+    pub async fn set_admin(&self, username: &str, argon2_hash: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO admins (username, argon2_hash) VALUES (?, ?)")
+            .bind(username)
+            .bind(argon2_hash)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("set_admin {username}"))?;
+        Ok(())
+    }
+
+    /// Fetch an admin's stored argon2 hash, or `None` if no such admin.
+    pub async fn get_admin_hash(&self, username: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT argon2_hash FROM admins WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await
+                .with_context(|| format!("get_admin_hash {username}"))?;
+        Ok(row.map(|(h,)| h))
+    }
+
+    /// Number of configured admins.
+    pub async fn admin_count(&self) -> Result<i64> {
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admins")
+            .fetch_one(&self.pool)
+            .await
+            .context("count admins")?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +317,28 @@ mod tests {
         assert!(db.delete_client("c").await.unwrap());
         assert!(!db.delete_client("c").await.unwrap()); // already gone
         assert_eq!(db.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn admin_set_get_upsert() {
+        let (_d, db) = temp_db().await;
+        assert_eq!(db.admin_count().await.unwrap(), 0);
+        assert!(db.get_admin_hash("admin").await.unwrap().is_none());
+
+        db.set_admin("admin", "$argon2id$hash1").await.unwrap();
+        assert_eq!(db.admin_count().await.unwrap(), 1);
+        assert_eq!(
+            db.get_admin_hash("admin").await.unwrap().as_deref(),
+            Some("$argon2id$hash1")
+        );
+
+        // set_admin is an upsert — replaces, doesn't add a second row.
+        db.set_admin("admin", "$argon2id$hash2").await.unwrap();
+        assert_eq!(db.admin_count().await.unwrap(), 1);
+        assert_eq!(
+            db.get_admin_hash("admin").await.unwrap().as_deref(),
+            Some("$argon2id$hash2")
+        );
     }
 
     #[test]
