@@ -6,6 +6,7 @@ pub mod aead;
 pub mod auth;
 pub mod config;
 pub mod decoy;
+pub mod fingerprint;
 pub mod frame;
 pub mod jitter;
 pub mod metrics;
