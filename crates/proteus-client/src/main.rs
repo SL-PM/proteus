@@ -257,6 +257,7 @@ async fn handle_socks5(
     // ----- Bridge SOCKS5 socket ↔ QUIC proxy stream -----
     let (tcp_r, tcp_w) = sock.into_split();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
+    // Idle padding is server-only in v0.5-rc.1; client passes None.
     proxy::bridge_quic_tcp(
         q_send,
         q_recv,
@@ -265,6 +266,7 @@ async fn handle_socks5(
         sa.send,
         sa.recv,
         bridge_buckets,
+        None,
     )
     .await
 }

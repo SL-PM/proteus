@@ -20,7 +20,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use proteus_core::{
     aead::{self, ProxyStreamAead},
     auth::{AuthRequest, AuthResponse, EXPORTER_LABEL, EXPORTER_LEN},
-    config::{ListenConfig, PaddingConfig, PolicyConfig, ServerConfig},
+    config::{IdlePaddingConfig, ListenConfig, PaddingConfig, PolicyConfig, ServerConfig},
     frame::{Frame, FrameType, read_frame, read_frame_aead, write_frame, write_frame_aead},
     proxy::ProxyOpen,
     tls,
@@ -66,6 +66,7 @@ impl TestServer {
             }),
             decoy: None,
             padding: PaddingConfig::default(),
+            idle_padding: IdlePaddingConfig::default(),
             log_level: "info".to_string(),
         };
 

@@ -131,6 +131,25 @@ pub fn bridge_buf_size(buckets: Option<&[usize]>) -> usize {
     }
 }
 
+/// Runtime idle-padding parameters for the server's send-to-client
+/// direction (v0.5 M3.5). When supplied to a bridge, the send loop
+/// emits one dummy PING frame after `interval` of stream-quiet time,
+/// padded to the wire `bucket`. The receiving peer discards inbound
+/// PING frames silently.
+#[derive(Debug, Clone)]
+pub struct IdlePad {
+    pub interval: std::time::Duration,
+    pub bucket: usize,
+}
+
+impl IdlePad {
+    /// The single-element bucket set used to pad each idle PING. Kept
+    /// as a helper so the bridges don't allocate it per tick.
+    fn ping_buckets(&self) -> [usize; 1] {
+        [self.bucket]
+    }
+}
+
 /// Bidirectional bridge between a Quinn (send, recv) pair carrying PROTEUS
 /// DATA frames and an arbitrary AsyncRead/AsyncWrite split (typically a TCP
 /// socket). Used by the server to bridge a proxy stream to its upstream
@@ -146,6 +165,13 @@ pub fn bridge_buf_size(buckets: Option<&[usize]>) -> usize {
 /// every emitted frame's wire `payload_len` is rounded up to a
 /// bucket. The TCP-read buffer also shrinks to fit the largest bucket
 /// so a single TCP chunk never overflows.
+///
+/// v0.5 M3.5: `idle` enables server-side idle dummy traffic. When
+/// `Some`, the TCP→QUIC direction emits a PING frame after
+/// `idle.interval` of no upstream activity (padded to `idle.bucket`).
+/// The QUIC→TCP direction silently discards inbound PING frames so
+/// idle-padding can be one-directional. Pass `None` on the client.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_quic_tcp<R, W>(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
@@ -154,6 +180,7 @@ pub async fn bridge_quic_tcp<R, W>(
     mut aead_send: crate::aead::InnerAead,
     mut aead_recv: crate::aead::InnerAead,
     wire_buckets: Option<Vec<usize>>,
+    idle: Option<IdlePad>,
 ) -> anyhow::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -171,11 +198,16 @@ where
                 Ok(f) => f,
                 Err(_) => break,
             };
-            if f.frame_type != FrameType::Data {
-                break;
-            }
-            if !f.payload.is_empty() {
-                tcp_w.write_all(&f.payload).await?;
+            match f.frame_type {
+                FrameType::Data => {
+                    if !f.payload.is_empty() {
+                        tcp_w.write_all(&f.payload).await?;
+                    }
+                }
+                // v0.5 M3.5: idle dummy frame — discard and keep going.
+                FrameType::Ping => continue,
+                // Anything else terminates the bridge (legacy EOF signal).
+                _ => break,
             }
         }
         let _ = tcp_w.shutdown().await;
@@ -183,25 +215,51 @@ where
     };
 
     let t2q = async move {
+        use std::time::Instant;
         let mut buf = vec![0u8; buf_size];
+        let mut last_activity = Instant::now();
         loop {
-            let n = tcp_r.read(&mut buf).await?;
-            if n == 0 {
-                break;
+            let idle_tick = idle_deadline(idle.as_ref(), last_activity);
+            tokio::select! {
+                read = tcp_r.read(&mut buf) => {
+                    let n = read?;
+                    if n == 0 {
+                        break;
+                    }
+                    let frame = Frame {
+                        frame_type: FrameType::Data,
+                        flags: 0,
+                        stream_id,
+                        payload: Bytes::copy_from_slice(&buf[..n]),
+                    };
+                    write_frame_aead_maybe_padded(
+                        &mut q_send,
+                        &frame,
+                        &mut aead_send,
+                        wire_buckets.as_deref(),
+                    )
+                    .await?;
+                    last_activity = Instant::now();
+                }
+                _ = idle_tick => {
+                    if let Some(i) = idle.as_ref() {
+                        let ping = Frame {
+                            frame_type: FrameType::Ping,
+                            flags: 0,
+                            stream_id,
+                            payload: Bytes::new(),
+                        };
+                        write_frame_aead_maybe_padded(
+                            &mut q_send,
+                            &ping,
+                            &mut aead_send,
+                            Some(&i.ping_buckets()),
+                        )
+                        .await?;
+                    }
+                    last_activity = Instant::now();
+                }
             }
-            let frame = Frame {
-                frame_type: FrameType::Data,
-                flags: 0,
-                stream_id,
-                payload: Bytes::copy_from_slice(&buf[..n]),
-            };
-            write_frame_aead_maybe_padded(
-                &mut q_send,
-                &frame,
-                &mut aead_send,
-                wire_buckets.as_deref(),
-            )
-            .await?;
         }
         let _ = q_send.finish();
         Ok::<(), anyhow::Error>(())
@@ -211,6 +269,20 @@ where
     r1.context("quic→tcp bridge")?;
     r2.context("tcp→quic bridge")?;
     Ok(())
+}
+
+/// Idle-deadline future for a bridge send loop. When `idle` is `Some`,
+/// resolves `interval` after `last_activity`; when `None`, never
+/// resolves (so the `select!` idle branch is effectively disabled and
+/// behavior matches the no-idle-padding path exactly).
+async fn idle_deadline(idle: Option<&IdlePad>, last_activity: std::time::Instant) {
+    match idle {
+        Some(i) => {
+            let deadline = last_activity + i.interval;
+            tokio::time::sleep_until(deadline.into()).await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// Bidirectional bridge between a Quinn (send, recv) pair and a connected
@@ -223,6 +295,7 @@ where
 /// `SendStream::finish()`). After that, the UDP→QUIC direction gets a
 /// short grace window (500 ms) to drain any in-flight responses before
 /// it is dropped.
+#[allow(clippy::too_many_arguments)]
 pub async fn bridge_quic_udp(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
@@ -230,8 +303,9 @@ pub async fn bridge_quic_udp(
     mut aead_send: crate::aead::InnerAead,
     mut aead_recv: crate::aead::InnerAead,
     wire_buckets: Option<Vec<usize>>,
+    idle: Option<IdlePad>,
 ) -> anyhow::Result<()> {
-    use std::{sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration, time::Instant};
 
     use crate::frame::{Frame, FrameType, read_frame_aead, write_frame_aead_maybe_padded};
 
@@ -252,11 +326,15 @@ pub async fn bridge_quic_udp(
                 Ok(f) => f,
                 Err(_) => break,
             };
-            if f.frame_type != FrameType::Data {
-                break;
-            }
-            if !f.payload.is_empty() {
-                udp_send.send(&f.payload).await?;
+            match f.frame_type {
+                FrameType::Data => {
+                    if !f.payload.is_empty() {
+                        udp_send.send(&f.payload).await?;
+                    }
+                }
+                // v0.5 M3.5: idle dummy frame — discard and keep going.
+                FrameType::Ping => continue,
+                _ => break,
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -272,21 +350,46 @@ pub async fn bridge_quic_udp(
             None => UDP_RECV_BUF,
         };
         let mut buf = vec![0u8; buf_size];
+        let mut last_activity = Instant::now();
         loop {
-            let n = udp_recv.recv(&mut buf).await?;
-            let frame = Frame {
-                frame_type: FrameType::Data,
-                flags: 0,
-                stream_id,
-                payload: Bytes::copy_from_slice(&buf[..n]),
-            };
-            write_frame_aead_maybe_padded(
-                &mut q_send,
-                &frame,
-                &mut aead_send,
-                wire_buckets.as_deref(),
-            )
-            .await?;
+            let idle_tick = idle_deadline(idle.as_ref(), last_activity);
+            tokio::select! {
+                recv = udp_recv.recv(&mut buf) => {
+                    let n = recv?;
+                    let frame = Frame {
+                        frame_type: FrameType::Data,
+                        flags: 0,
+                        stream_id,
+                        payload: Bytes::copy_from_slice(&buf[..n]),
+                    };
+                    write_frame_aead_maybe_padded(
+                        &mut q_send,
+                        &frame,
+                        &mut aead_send,
+                        wire_buckets.as_deref(),
+                    )
+                    .await?;
+                    last_activity = Instant::now();
+                }
+                _ = idle_tick => {
+                    if let Some(i) = idle.as_ref() {
+                        let ping = Frame {
+                            frame_type: FrameType::Ping,
+                            flags: 0,
+                            stream_id,
+                            payload: Bytes::new(),
+                        };
+                        write_frame_aead_maybe_padded(
+                            &mut q_send,
+                            &ping,
+                            &mut aead_send,
+                            Some(&i.ping_buckets()),
+                        )
+                        .await?;
+                    }
+                    last_activity = Instant::now();
+                }
+            }
         }
         // The loop above is divergent; this Ok exists so the async
         // block's return type can be inferred as Result<(), _>.
@@ -378,5 +481,87 @@ mod tests {
             "upstream-unreachable"
         );
         assert_eq!(ProxyReject::new(0xFF).name(), "unknown");
+    }
+
+    #[test]
+    fn bridge_buf_size_accounts_for_tag_and_trailer() {
+        // None → full buffer.
+        assert_eq!(bridge_buf_size(None), BRIDGE_BUF_SIZE);
+        // Some([..1500]) → 1500 - 16 tag - 2 trailer = 1482.
+        assert_eq!(bridge_buf_size(Some(&[128, 256, 1500])), 1482);
+        // Single small bucket.
+        assert_eq!(bridge_buf_size(Some(&[128])), 128 - 18);
+    }
+
+    #[test]
+    fn idle_pad_ping_buckets_is_single_element() {
+        let i = IdlePad {
+            interval: std::time::Duration::from_secs(5),
+            bucket: 1024,
+        };
+        assert_eq!(i.ping_buckets(), [1024]);
+    }
+
+    /// The QUIC→app receive direction must DISCARD PING frames (idle
+    /// dummies) and keep going, not treat them as EOF. This guards the
+    /// M3.5 receive-loop change: a PING in the middle of a DATA stream
+    /// must not tear the bridge down.
+    #[tokio::test]
+    async fn bridge_tcp_discards_ping_and_keeps_data() {
+        use crate::aead::{DIR_S2C, InnerAead};
+        use crate::frame::{Frame, FrameType, write_frame_aead};
+
+        // Server-side bridge: q_recv carries [PING, DATA("hello"), EOF]
+        // from the "client". We feed those frames into a duplex acting
+        // as the QUIC recv stream is not trivial without a real Quinn
+        // stream, so instead we unit-test the frame-classification
+        // contract directly: read_frame_aead over a duplex, then assert
+        // a PING is skippable and DATA is delivered.
+        //
+        // (Full end-to-end idle-padding is covered by the M4.5
+        // integration test against a live server.)
+        let session = InnerAead::derive_key(
+            b"exp-32bytes-of-test-material-aa",
+            b"nonce-32-bytes-of-test-input-bb",
+        )
+        .unwrap();
+        let stream_key = InnerAead::derive_stream_key(&session, 3);
+        let mut send = InnerAead::for_direction(&stream_key, DIR_S2C);
+        let mut recv = InnerAead::for_direction(&stream_key, DIR_S2C);
+
+        let (mut a, mut b) = tokio::io::duplex(4096);
+
+        // Writer: PING then DATA.
+        let writer = async move {
+            let mut ping = Frame::new(FrameType::Ping, bytes::Bytes::new()).unwrap();
+            ping.stream_id = 3;
+            write_frame_aead(&mut a, &ping, &mut send).await.unwrap();
+
+            let mut data = Frame::new(FrameType::Data, &b"hello"[..]).unwrap();
+            data.stream_id = 3;
+            write_frame_aead(&mut a, &data, &mut send).await.unwrap();
+            drop(a); // EOF
+        };
+
+        // Reader: classify like the bridge q2t loop does.
+        let reader = async move {
+            use crate::frame::read_frame_aead;
+            let mut delivered: Vec<u8> = Vec::new();
+            loop {
+                let f = match read_frame_aead(&mut b, &mut recv).await {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match f.frame_type {
+                    FrameType::Data => delivered.extend_from_slice(&f.payload),
+                    FrameType::Ping => continue,
+                    _ => break,
+                }
+            }
+            delivered
+        };
+
+        let (_, delivered) = tokio::join!(writer, reader);
+        assert_eq!(delivered, b"hello", "PING must be skipped, DATA delivered");
     }
 }

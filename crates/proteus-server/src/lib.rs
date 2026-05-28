@@ -99,6 +99,9 @@ struct ServerState {
     /// bucket-padded to one of these wire `payload_len` sizes.
     /// `None` = v0.4-compatible no-padding behavior.
     padding_buckets: Option<Arc<Vec<usize>>>,
+    /// v0.5 M3.5: when `Some`, the server emits idle dummy PING frames
+    /// per proxy stream during quiet periods. `None` = no idle padding.
+    idle_pad: Option<proxy::IdlePad>,
 }
 
 /// Built, bound, ready-to-run PROTEUS server.
@@ -166,6 +169,16 @@ impl Server {
             None
         };
 
+        // v0.5 M3.5: server-side idle dummy traffic.
+        let idle_pad: Option<proxy::IdlePad> = if cfg.idle_padding.enabled {
+            Some(proxy::IdlePad {
+                interval: Duration::from_secs(cfg.idle_padding.interval_secs),
+                bucket: cfg.idle_padding.bucket,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             endpoint,
             local_addr,
@@ -179,6 +192,7 @@ impl Server {
                 decoy_html,
                 decoy_headers,
                 padding_buckets,
+                idle_pad,
             },
         })
     }
@@ -246,6 +260,19 @@ impl Server {
     /// Effective bucket set in use, or `None` when padding is off.
     pub fn padding_buckets(&self) -> Option<&[usize]> {
         self.state.padding_buckets.as_deref().map(|v| v.as_slice())
+    }
+
+    /// True if v0.5 idle dummy traffic is active.
+    pub fn idle_padding_enabled(&self) -> bool {
+        self.state.idle_pad.is_some()
+    }
+
+    /// Idle-padding (interval_secs, bucket) if active.
+    pub fn idle_padding_summary(&self) -> Option<(u64, usize)> {
+        self.state
+            .idle_pad
+            .as_ref()
+            .map(|i| (i.interval.as_secs(), i.bucket))
     }
 
     /// Reference to the underlying Quinn endpoint. Tests can use this
@@ -438,6 +465,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
         let metrics = state.metrics.clone();
         let session_key = session_key.clone();
         let padding_buckets = state.padding_buckets.clone();
+        let idle_pad = state.idle_pad.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_proxy_stream(
                 q_send,
@@ -446,6 +474,7 @@ async fn handle_conn(incoming: quinn::Incoming, state: ServerState) -> Result<()
                 metrics,
                 session_key,
                 padding_buckets,
+                idle_pad,
             )
             .await
             {
@@ -471,6 +500,7 @@ async fn reject_auth(
     conn.close(AUTH_FAIL_CLOSE_CODE.into(), b"");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_proxy_stream(
     mut q_send: quinn::SendStream,
     mut q_recv: quinn::RecvStream,
@@ -478,6 +508,7 @@ async fn handle_proxy_stream(
     metrics: Arc<Metrics>,
     session_key: Arc<[u8; aead::KEY_LEN]>,
     padding_buckets: Option<Arc<Vec<usize>>>,
+    idle_pad: Option<proxy::IdlePad>,
 ) -> Result<()> {
     // M5.4.1: every frame on a per-target proxy stream is AEAD-wrapped
     // post-auth. Derive this stream's key + (send, recv) pair from the
@@ -528,6 +559,7 @@ async fn handle_proxy_stream(
                 sa.recv,
                 stream_id,
                 padding_buckets,
+                idle_pad,
             )
             .await
         }
@@ -543,6 +575,7 @@ async fn handle_proxy_stream(
                 sa.recv,
                 stream_id,
                 padding_buckets,
+                idle_pad,
             )
             .await
         }
@@ -602,6 +635,7 @@ async fn proxy_to_tcp(
     aead_recv: aead::InnerAead,
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
+    idle_pad: Option<proxy::IdlePad>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -674,6 +708,7 @@ async fn proxy_to_tcp(
         aead_send,
         aead_recv,
         bridge_buckets,
+        idle_pad,
     )
     .await
 }
@@ -690,6 +725,7 @@ async fn proxy_to_udp(
     aead_recv: aead::InnerAead,
     stream_id: u64,
     padding_buckets: Option<Arc<Vec<usize>>>,
+    idle_pad: Option<proxy::IdlePad>,
 ) -> Result<()> {
     let pad_buckets = padding_buckets.as_deref().map(|v| v.as_slice());
     let resolved = match resolve_target(&host, port).await {
@@ -765,7 +801,16 @@ async fn proxy_to_udp(
 
     metrics.proxy_udp_opened_inc();
     let bridge_buckets = padding_buckets.as_deref().map(|v| v.to_vec());
-    proxy::bridge_quic_udp(q_send, q_recv, udp, aead_send, aead_recv, bridge_buckets).await
+    proxy::bridge_quic_udp(
+        q_send,
+        q_recv,
+        udp,
+        aead_send,
+        aead_recv,
+        bridge_buckets,
+        idle_pad,
+    )
+    .await
 }
 
 // ---------------- M13 H3 decoy ----------------

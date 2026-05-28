@@ -33,6 +33,9 @@ pub struct ServerConfig {
     /// v0.5 M1.5+: bucket padding for outgoing frames.
     #[serde(default)]
     pub padding: PaddingConfig,
+    /// v0.5 M3.5: server-side idle dummy traffic.
+    #[serde(default)]
+    pub idle_padding: IdlePaddingConfig,
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -100,6 +103,44 @@ impl PaddingConfig {
             crate::padding::DEFAULT_BUCKETS
         } else {
             &self.buckets
+        }
+    }
+}
+
+/// v0.5 M3.5: server-side idle dummy traffic. When enabled, the server
+/// emits one PING frame per proxy stream after `interval_secs` of
+/// stream-quiet time (no real DATA flowing server→client), eliminating
+/// the "PROTEUS-idle = total silence" wire signal. Server-only — the
+/// client discards inbound PING frames regardless.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IdlePaddingConfig {
+    /// Master switch. Default false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Seconds of stream-quiet before a dummy PING is sent. Default 5.
+    #[serde(default = "default_idle_interval_secs")]
+    pub interval_secs: u64,
+    /// Wire `payload_len` bucket the dummy PING is padded to. Default
+    /// 1024. Should be one of the `padding.buckets` values for
+    /// consistency, though it's not required to be.
+    #[serde(default = "default_idle_bucket")]
+    pub bucket: usize,
+}
+
+fn default_idle_interval_secs() -> u64 {
+    5
+}
+
+fn default_idle_bucket() -> usize {
+    1024
+}
+
+impl Default for IdlePaddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_idle_interval_secs(),
+            bucket: default_idle_bucket(),
         }
     }
 }

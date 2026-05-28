@@ -70,6 +70,20 @@ async fn main() -> Result<()> {
             None => "hardcoded nginx-style (3 headers + fresh Date)".to_string(),
         }
     );
+    println!(
+        "padding:      {}",
+        match server.padding_buckets() {
+            Some(b) => format!("on, buckets {b:?}"),
+            None => "off (v0.4-compatible wire)".to_string(),
+        }
+    );
+    println!(
+        "idle padding: {}",
+        match server.idle_padding_summary() {
+            Some((secs, bucket)) => format!("on, PING every {secs}s padded to {bucket}B"),
+            None => "off".to_string(),
+        }
+    );
     if server.clients_len() == 0 {
         eprintln!("warning: no clients configured; all auth attempts will be rejected");
     }
