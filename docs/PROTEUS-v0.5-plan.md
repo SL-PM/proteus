@@ -228,9 +228,13 @@ profile-driven sampling).
 
 | | Milestone | Effort |
 |---|---|---|
-| M6.5 | `proteus_core::jitter` module (bounded delay sampler) + `TimingJitterConfig` + this design | small |
-| M7.5 | Wire-up: apply jitter on the proxy-stream send path (server + client bridges) | small |
-| M8.5 | Tests (sampler bounds + data round-trips with jitter on) + sign-off doc | small |
+| M6.5 | `proteus_core::jitter` module (bounded delay sampler) + `TimingJitterConfig` + this design ✅ | small |
+| M7.5 | Wire-up: apply jitter on the proxy-stream send path (server + client bridges) ✅ | small |
+| M8.5 | Tests (sampler bounds + data round-trips with jitter on) + [`m8.5-timing-jitter-signoff.md`](m8.5-timing-jitter-signoff.md) ✅ | small |
+
+**v0.5-rc.2 = M6.5 through M8.5, all complete.** Profile-driven
+size + inter-arrival sampling (needs a capture corpus) and a
+lower-overhead token-bucket pacer remain deferred.
 
 ## 7. Migration impact
 

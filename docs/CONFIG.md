@@ -59,7 +59,22 @@ idle_padding:
   enabled: true
   interval_secs: 5     # quiet time before a dummy PING
   bucket: 1024         # wire payload_len the PING is padded to
+
+# Optional — v0.5-rc.2 M6.5. Inter-arrival timing jitter on the send
+# path. Sender-side only: set independently on each end, no lockstep.
+# Cost is throughput — see the note below.
+timing_jitter:
+  enabled: true
+  min_ms: 0
+  max_ms: 5            # uniform delay [min_ms, max_ms] before each proxy-stream frame
 ```
+
+> **v0.5 timing-jitter note:** unlike padding, jitter needs NO wire
+> agreement — the receiver is oblivious. The cost is latency: a uniform
+> `[min, max]` delay caps bulk throughput at roughly
+> `frame_size / avg_delay` (≈300 KB/s at a 5 ms average). Keep the range
+> small for bulk traffic; widen it only for interactive/low-volume use.
+> See [`m8.5-timing-jitter-signoff.md`](m8.5-timing-jitter-signoff.md) §4.
 
 > **v0.5 padding note:** padded and un-padded frames are NOT
 > wire-compatible. `padding.enabled` defaults to `false` so a v0.4
