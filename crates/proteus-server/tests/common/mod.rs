@@ -44,7 +44,32 @@ impl TestServer {
     /// server is configured with a single client (`client_id`) whose
     /// freshly-generated keypair is returned for the test to sign
     /// with. Policy is wide open. Decoy is the embedded default.
+    /// Padding is OFF (v0.4-compatible).
     pub async fn start(client_id: &str) -> Result<Self> {
+        Self::start_with(
+            client_id,
+            PaddingConfig::default(),
+            IdlePaddingConfig::default(),
+        )
+        .await
+    }
+
+    /// Start with v0.5 bucket padding enabled, using the default
+    /// bucket set. Idle padding stays off.
+    pub async fn start_padded(client_id: &str) -> Result<Self> {
+        let padding = PaddingConfig {
+            enabled: true,
+            buckets: Vec::new(), // → DEFAULT_BUCKETS
+        };
+        Self::start_with(client_id, padding, IdlePaddingConfig::default()).await
+    }
+
+    /// Full-control constructor: explicit padding + idle-padding config.
+    pub async fn start_with(
+        client_id: &str,
+        padding: PaddingConfig,
+        idle_padding: IdlePaddingConfig,
+    ) -> Result<Self> {
         let mut csprng = OsRng;
         let sk = SigningKey::generate(&mut csprng);
         let vk = sk.verifying_key();
@@ -65,8 +90,8 @@ impl TestServer {
                 allow_udp: true,
             }),
             decoy: None,
-            padding: PaddingConfig::default(),
-            idle_padding: IdlePaddingConfig::default(),
+            padding,
+            idle_padding,
             log_level: "info".to_string(),
         };
 
@@ -89,6 +114,24 @@ impl TestServer {
             _join: join,
         })
     }
+}
+
+/// Read ONE raw PROTEUS frame off a Quinn recv stream WITHOUT
+/// depadding or AEAD-opening. Returns `(flags, wire_payload_len)` so
+/// a test can assert on the on-wire size distribution (M4.5). Reads
+/// exactly the 16-byte header then drains `payload_len` body bytes.
+pub async fn read_raw_wire_frame(recv: &mut quinn::RecvStream) -> Result<(u16, usize)> {
+    // quinn::RecvStream has an inherent `read_exact` (distinct from the
+    // tokio AsyncReadExt one), so no trait import is needed.
+    let mut header = [0u8; 16];
+    recv.read_exact(&mut header).await.context("read header")?;
+    let flags = u16::from_be_bytes([header[2], header[3]]);
+    let payload_len = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
+    let mut body = vec![0u8; payload_len];
+    if payload_len > 0 {
+        recv.read_exact(&mut body).await.context("read body")?;
+    }
+    Ok((flags, payload_len))
 }
 
 /// Build a Quinn client endpoint bound to an ephemeral port. Caller
