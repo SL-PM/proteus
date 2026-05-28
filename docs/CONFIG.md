@@ -47,7 +47,25 @@ policy:
 # decoy will serve to non-PROTEUS QUIC connections.
 decoy:
   static_page: "configs/decoy.html"
+
+# Optional — v0.5 M1.5+. Bucket-padding for outgoing frames. Both ends
+# (server + client) must set the same `enabled` value. Default off.
+padding:
+  enabled: true
+  buckets: [128, 256, 512, 1024, 1500]   # omit for the default set
+
+# Optional — v0.5 M3.5, server only. Idle dummy PING traffic.
+idle_padding:
+  enabled: true
+  interval_secs: 5     # quiet time before a dummy PING
+  bucket: 1024         # wire payload_len the PING is padded to
 ```
+
+> **v0.5 padding note:** padded and un-padded frames are NOT
+> wire-compatible. `padding.enabled` defaults to `false` so a v0.4
+> deployment is unaffected; flip it on **both** server and client in
+> lockstep. See [`PROTEUS-v0.5-plan.md`](PROTEUS-v0.5-plan.md) §7 and
+> [`m5.5-padding-signoff.md`](m5.5-padding-signoff.md).
 
 ---
 

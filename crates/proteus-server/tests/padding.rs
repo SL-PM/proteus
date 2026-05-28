@@ -140,6 +140,8 @@ async fn padded_server_frames_land_on_buckets() -> Result<()> {
         .filter(|s| DEFAULT_BUCKETS.contains(s))
         .count();
     let ratio = bucketed as f64 / all_sizes.len() as f64;
+    // Surfaced with `--nocapture` for the M5.5 sign-off measurement.
+    eprintln!("M4.5 observed server→client wire sizes: {all_sizes:?}");
     assert!(
         ratio >= 0.95,
         "expected >=95% of server frames on a bucket size; got {:.0}% \

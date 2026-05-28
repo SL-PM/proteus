@@ -208,12 +208,16 @@ When all true → v0.5-rc.1 taggable:
 
 | | Milestone | Effort |
 |---|---|---|
-| M0.5 | v0.5 plan doc + branch | this commit |
-| M1.5 | `proteus_core::padding` module + bucket-rounding logic + PADDED-flag encode/decode | small |
-| M2.5 | Wire-up: client + server pad/un-pad every proxy-stream frame when config opt-in | small |
-| M3.5 | Idle-padding timer + dummy PING emission (server side) | small |
-| M4.5 | Integration test verifying bucket distribution + no-regression sweep | small |
-| M5.5 | Sign-off: manual capture comparison + `m5.5-padding-signoff.md` | small |
+| M0.5 | v0.5 plan doc + branch ✅ | small |
+| M1.5 | `proteus_core::padding` module + bucket-rounding logic + PADDED-flag encode/decode ✅ | small |
+| M2.5 | Wire-up: client + server pad/un-pad every proxy-stream frame when config opt-in ✅ | small |
+| M3.5 | Idle-padding timer + dummy PING emission (server side) ✅ | small |
+| M4.5 | Integration test verifying bucket distribution + no-regression sweep ✅ | small |
+| M5.5 | Sign-off: wire-distribution evidence + [`m5.5-padding-signoff.md`](m5.5-padding-signoff.md) ✅ | small |
+
+**v0.5-rc.1 = M0.5 through M5.5, all complete.** Profile-driven
+sampling + timing jitter (rc.2) and SNI rotation / port hopping
+(rc.2 / v0.6) remain deferred per §3.
 
 Total: ~5 commits, ~1-2 sessions for a complete rc.1.
 
