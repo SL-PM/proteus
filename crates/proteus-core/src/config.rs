@@ -170,6 +170,14 @@ pub struct TimingJitterConfig {
     /// Upper bound of the uniform delay in milliseconds. Default 5.
     #[serde(default = "default_jitter_max_ms")]
     pub max_ms: u64,
+    /// v0.5 M9.5 token-bucket burst allowance, in frames. `0` (default)
+    /// = pure per-frame jitter (every frame pays the delay, rc.2
+    /// behavior). `>= 1` = let that many frames through with zero added
+    /// delay before pacing kicks in; the allowance refills over idle
+    /// time. Lowers jitter's latency cost for bursty / interactive
+    /// traffic without changing the sustained-rate ceiling.
+    #[serde(default)]
+    pub burst: u32,
 }
 
 fn default_jitter_max_ms() -> u64 {
@@ -182,6 +190,7 @@ impl Default for TimingJitterConfig {
             enabled: false,
             min_ms: 0,
             max_ms: default_jitter_max_ms(),
+            burst: 0,
         }
     }
 }

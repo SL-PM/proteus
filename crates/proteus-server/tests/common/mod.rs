@@ -75,12 +75,24 @@ impl TestServer {
     }
 
     /// Start with v0.5-rc.2 timing jitter enabled over `[min_ms, max_ms]`.
-    /// Padding + idle padding stay off.
+    /// Padding + idle padding stay off. `burst = 0` → per-frame jitter.
     pub async fn start_jittered(client_id: &str, min_ms: u64, max_ms: u64) -> Result<Self> {
+        Self::start_jittered_burst(client_id, min_ms, max_ms, 0).await
+    }
+
+    /// Start with v0.5 M9.5 token-bucket pacing: jitter over
+    /// `[min_ms, max_ms]` with a `burst`-frame free allowance.
+    pub async fn start_jittered_burst(
+        client_id: &str,
+        min_ms: u64,
+        max_ms: u64,
+        burst: u32,
+    ) -> Result<Self> {
         let jitter = TimingJitterConfig {
             enabled: true,
             min_ms,
             max_ms,
+            burst,
         };
         Self::start_with(
             client_id,
