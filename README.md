@@ -1,10 +1,11 @@
 # PROTEUS
 
-> **Status: v0.5.0-rc.1 working research prototype.**
+> **Status: v0.5.0-rc.2 working research prototype.**
 > v0.4 (Approach C) added inner AEAD wire wrapping, TLS 1.3 0-RTT,
 > QUIC connection migration, and a high-fidelity H3 decoy. v0.5-rc.1
-> adds **wire-pattern padding**: per-frame bucket-padding (size leak
-> closed) + server-side idle dummy traffic (silence leak closed).
+> added **wire-pattern padding** (per-frame bucket-padding + idle
+> dummy traffic). v0.5-rc.2 adds **send-path timing jitter** —
+> decorrelating PROTEUS's inter-arrival timing from the application's.
 
 ## What this is
 
@@ -126,6 +127,22 @@ What changed since v0.4.0 — wire-pattern padding (opt-in, default off):
   a bucket (observed 100%). A padding-off control proves the change is
   real. Sign-off: [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md).
 
+## v0.5-rc.2 highlights
+
+Send-path timing jitter (opt-in, default off):
+
+- **Bounded random delay** before each outgoing proxy-stream DATA
+  frame, sampled uniformly from `[min_ms, max_ms]` (M6.5 + M7.5).
+  Breaks the deterministic "write-the-instant-data-arrives" timing
+  signature. Applied on both server and client send paths; idle PINGs
+  excluded.
+- **Sender-side only** — no wire-format change, no flag, no lockstep.
+  Each end enables it independently. (Strictly simpler than padding.)
+- Integration test (M8.5) proves data round-trips byte-identical
+  under jitter (no AEAD-counter desync) and that the delay is on the
+  path. Sign-off:
+  [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md).
+
 Known limitations (honestly documented, deferred):
 
 - `proteus/0.3` ALPN still advertised. Unification needs an h3 fork
@@ -136,10 +153,11 @@ Known limitations (honestly documented, deferred):
   cover-host headers are per-request unique (e.g. cloudflare's
   `cf-ray`, `__cf_bm`) so a prober making two requests sees the same
   values. True fix = live decoy-proxy (Approach B, v0.5+).
-- Bucket-padding quantizes sizes to 5 spikes — still
-  distinguishable from a real cover host's smooth distribution, and
-  timing is unchanged. Profile-driven sampling + timing jitter (closing
-  A7) are **v0.5-rc.2**.
+- Bucket-padding quantizes sizes to 5 spikes; timing jitter is uniform.
+  Neither *matches* a real cover host's distribution — both are
+  decorrelators, not mimics. Profile-driven size + inter-arrival
+  sampling (fully closing A7) needs a capture corpus and is deferred.
+  Timing jitter also costs throughput (`frame_size / avg_delay`).
 
 ## Milestones
 
@@ -169,7 +187,7 @@ v0.3.0-rc.1 tagged 2026-05-27.
 Full milestone matrix:
 [`docs/PROTEUS-v0.4-plan.md`](docs/PROTEUS-v0.4-plan.md) §9.
 
-### v0.5 (M0.5–M5.5) — rc.1
+### v0.5 (M0.5–M8.5)
 
 | | Milestone | Status |
 |---|---|:---:|
@@ -178,10 +196,14 @@ Full milestone matrix:
 | M2.5 | Wire-up: server + client + udp-test pad/un-pad | ✅ |
 | M3.5 | Server-side idle dummy traffic | ✅ |
 | M4.5 | Wire-distribution integration test | ✅ |
-| M5.5 | Sign-off | ✅ |
+| M5.5 | Sign-off (rc.1) | ✅ |
+| M6.5 | `proteus_core::jitter` sampler + `TimingJitterConfig` | ✅ |
+| M7.5 | Wire-up: jitter on the proxy-stream send path | ✅ |
+| M8.5 | Jitter integration test + sign-off (rc.2) | ✅ |
 
-Deferred to v0.5-rc.2: profile-driven size sampling, timing jitter,
-SNI rotation, port hopping. Matrix:
+Deferred beyond rc.2: profile-driven size + inter-arrival sampling
+(needs a capture corpus), token-bucket pacer, SNI rotation, port
+hopping. Matrix:
 [`docs/PROTEUS-v0.5-plan.md`](docs/PROTEUS-v0.5-plan.md) §6.
 
 ## Documents
@@ -199,7 +221,8 @@ SNI rotation, port hopping. Matrix:
 | [`docs/m7.4-connection-migration.md`](docs/m7.4-connection-migration.md) | Migration design |
 | [`docs/m2.4-dispatch-research.md`](docs/m2.4-dispatch-research.md) | Why ALPN unification needs v1.0 scope |
 | [`docs/m9.4-rc1-signoff.md`](docs/m9.4-rc1-signoff.md) | v0.4-rc.1 acceptance evidence |
-| [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md) | v0.5-rc.1 acceptance evidence |
+| [`docs/m5.5-padding-signoff.md`](docs/m5.5-padding-signoff.md) | v0.5-rc.1 acceptance evidence (padding) |
+| [`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md) | v0.5-rc.2 acceptance evidence (jitter) |
 | [`docs/m14-comparison-report.md`](docs/m14-comparison-report.md) | v0.3 wire fingerprint baseline |
 | [`docs/spike-m19-pq.md`](docs/spike-m19-pq.md) | Post-quantum feasibility for v1.0 |
 | [`docs/fingerprint-profile.example.yaml`](docs/fingerprint-profile.example.yaml) | M16 schema for v0.5-rc.2 profile sampling |
@@ -214,16 +237,18 @@ SNI rotation, port hopping. Matrix:
   (H3 decoy byte-identical to cover host modulo per-request cf-ray).
 - **Partially closed:** A5 active DPI / wire-pattern — inner AEAD +
   v0.5 bucket-padding (per-frame size leak) + idle dummies (silence
-  leak). Distribution shape + timing remain.
-- **Out of scope until later:** A6 cert inspection / A7 statistical
-  analysis (rc.2 profile sampling + timing) / A8 IP-block / A9 PQ /
-  A10 global passive / A11 endpoint compromise. See the threat-model doc.
+  leak). A7 statistical analysis — v0.5-rc.2 timing jitter
+  decorrelates send timing. Distribution *shape* (size + timing) still
+  differs from a real cover host.
+- **Out of scope until later:** A6 cert inspection / A7 distribution
+  matching (profile-driven sampling, needs a corpus) / A8 IP-block /
+  A9 PQ / A10 global passive / A11 endpoint compromise.
 
 ## Build / test
 
 ```sh
 cargo build --workspace
-cargo test  --workspace        # 146 tests (119 core + 5 server-lib + 14 tools + 8 server-integration)
+cargo test  --workspace        # 153 tests (124 core + 5 server-lib + 14 tools + 10 server-integration)
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
@@ -231,7 +256,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Architecture (one paragraph)
 
 `proteus-core` is the shared library: `aead`, `auth`, `config`,
-`decoy`, `frame`, `metrics`, `padding`, `policy`, `proxy`,
+`decoy`, `frame`, `jitter`, `metrics`, `padding`, `policy`, `proxy`,
 `ratelimit`, `replay`, `tls`. `proteus-server` is now a library + thin bin — the library
 crate (`proteus_server::Server`) exposes `bind/run/shutdown/metrics`
 for in-process integration tests; the bin parses CLI args and prints

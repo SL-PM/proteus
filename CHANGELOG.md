@@ -4,6 +4,49 @@ All notable changes to PROTEUS are tracked here. Pre-1.0 the entry
 granularity is per-commit; once we hit 1.0 we move to grouped
 release-note style.
 
+## [v0.5.0-rc.2] — 2026-05-28
+
+Send-path timing jitter. Attacks the *timing* axis of A7 that rc.1's
+bucket-padding (the *size* axis) left untouched. Opt-in, default off.
+Design + sign-off:
+[`docs/PROTEUS-v0.5-plan.md`](docs/PROTEUS-v0.5-plan.md) §11,
+[`docs/m8.5-timing-jitter-signoff.md`](docs/m8.5-timing-jitter-signoff.md).
+
+**Highlights:**
+
+* **Bounded random delay (M6.5 + M7.5).** A new `proteus_core::jitter`
+  module samples a uniform delay in `[min_ms, max_ms]`; the proxy
+  bridges await it before each outgoing DATA frame (idle PINGs
+  excluded). Applied on both server and client send paths. Breaks the
+  deterministic "write-the-instant-data-arrives" send signature.
+* **Sender-side only.** No wire-format change, no flag, no lockstep —
+  the receiver is oblivious. Each end enables it independently via
+  `timing_jitter.{enabled, min_ms, max_ms}` (default off). Strictly
+  simpler than rc.1 padding, which needed `FLAG_PADDED` + both ends.
+* **Validated config.** `TimingJitterConfig::validate()` rejects
+  `min_ms > max_ms` at bind/startup time.
+* **Integration test (M8.5).** `tests/jitter.rs` proves a payload
+  round-trips byte-identical under a constant 20ms server jitter (no
+  AEAD-counter desync), that the echo can't beat the delay (it's on
+  the path), and that a 5-frame burst reassembles in order.
+
+**Known limitations (deferred):** uniform jitter is a *decorrelator,
+not a mimic* — it doesn't match a real cover host's inter-arrival
+distribution; a distribution-modelling A7 attacker can still tell them
+apart. Closing that needs profile-driven inter-arrival sampling (same
+capture-corpus dependency as size sampling). Per-frame delay also
+costs throughput (`frame_size / avg_delay` ceiling). A token-bucket
+pacer (lower overhead) and profile sampling are future increments.
+`proteus/0.3` ALPN remains distinctive (v1.0).
+
+153 tests pass (+7 since v0.5.0-rc.1). fmt + clippy -D warnings clean.
+
+### Commits since v0.5.0-rc.1
+
+* `dcec38b` feat(m6.5): proteus_core::jitter — bounded timing-jitter sampler + config
+* `ba3f10f` feat(m7.5): apply timing jitter on the proxy-stream send path
+* `2013672` test(m8.5): timing-jitter integration test + v0.5-rc.2 sign-off
+
 ## [v0.5.0-rc.1] — 2026-05-28
 
 Wire-pattern padding. Reduces the v0.4 connection-envelope
