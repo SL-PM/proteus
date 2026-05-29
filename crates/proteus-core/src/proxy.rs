@@ -223,6 +223,10 @@ where
                         tcp_w.write_all(&f.payload).await?;
                     }
                 }
+                // v0.6 optimistic-open: the server's verdict is the first
+                // frame on the stream — ACCEPT = proceed, REJECT = close.
+                FrameType::ProxyAccept => continue,
+                FrameType::ProxyReject => break,
                 // v0.5 M3.5: idle dummy frame — discard and keep going.
                 FrameType::Ping => continue,
                 // Anything else terminates the bridge (legacy EOF signal).

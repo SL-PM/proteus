@@ -27,11 +27,10 @@ use proteus_core::{
     config::ClientConfig,
     fingerprint::Distribution,
     frame::{
-        Frame, FrameType, read_frame, read_frame_aead, write_frame_aead_maybe_padded,
-        write_frame_maybe_padded,
+        Frame, FrameType, read_frame, write_frame_aead_maybe_padded, write_frame_maybe_padded,
     },
     jitter::{Jitter, JitterPlan},
-    proxy::{self, ProxyOpen, ProxyReject, reject as reject_codes},
+    proxy::{self, ProxyOpen},
     subscription::Subscription,
     tls,
 };
@@ -49,9 +48,6 @@ const SOCKS5_ATYP_IPV4: u8 = 0x01;
 const SOCKS5_ATYP_DOMAIN: u8 = 0x03;
 const SOCKS5_ATYP_IPV6: u8 = 0x04;
 const SOCKS5_REP_SUCCESS: u8 = 0x00;
-const SOCKS5_REP_GENERAL_FAILURE: u8 = 0x01;
-const SOCKS5_REP_RULESET: u8 = 0x02;
-const SOCKS5_REP_HOST_UNREACHABLE: u8 = 0x04;
 const SOCKS5_REP_CMD_NOT_SUPPORTED: u8 = 0x07;
 const SOCKS5_REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
@@ -400,7 +396,7 @@ async fn handle_socks5(
     let port = u16::from_be_bytes(port_buf);
 
     // ----- Open QUIC proxy stream + PROXY_OPEN (AEAD-wrapped) -----
-    let (mut q_send, mut q_recv) = qconn.open_bi().await.context("open proxy bi")?;
+    let (mut q_send, q_recv) = qconn.open_bi().await.context("open proxy bi")?;
     let stream_id = q_send.id().index();
     let mut sa = ProxyStreamAead::for_client(&sh.session_key, stream_id);
 
@@ -415,21 +411,12 @@ async fn handle_socks5(
         .await
         .context("write PROXY_OPEN")?;
 
-    let resp = read_frame_aead(&mut q_recv, &mut sa.recv)
-        .await
-        .context("read PROXY_ACCEPT/REJECT")?;
-    let rep = match resp.frame_type {
-        FrameType::ProxyAccept => SOCKS5_REP_SUCCESS,
-        FrameType::ProxyReject => {
-            let r = ProxyReject::decode(&resp.payload)?;
-            map_reject_to_socks5(r.reason)
-        }
-        _ => SOCKS5_REP_GENERAL_FAILURE,
-    };
-    send_socks5_reply(&mut sock, rep).await?;
-    if rep != SOCKS5_REP_SUCCESS {
-        return Ok(());
-    }
+    // Optimistic open (v0.6): don't block on PROXY_ACCEPT. Reply "success"
+    // to the app right away so its first bytes (e.g. the TLS ClientHello)
+    // pipeline straight behind PROXY_OPEN — saving one tunnel RTT per
+    // connection. The bridge consumes the server's verdict frame
+    // (PROXY_ACCEPT is skipped; PROXY_REJECT closes the stream).
+    send_socks5_reply(&mut sock, SOCKS5_REP_SUCCESS).await?;
 
     // ----- Bridge SOCKS5 socket ↔ QUIC proxy stream -----
     let (tcp_r, tcp_w) = sock.into_split();
@@ -456,14 +443,4 @@ async fn send_socks5_reply(sock: &mut TcpStream, rep: u8) -> Result<()> {
     sock.write_all(&[SOCKS5_VER, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0])
         .await
         .context("write SOCKS5 reply")
-}
-
-fn map_reject_to_socks5(reason: u8) -> u8 {
-    match reason {
-        reject_codes::POLICY_DENIED => SOCKS5_REP_RULESET,
-        reject_codes::UPSTREAM_UNREACHABLE => SOCKS5_REP_HOST_UNREACHABLE,
-        reject_codes::UNSUPPORTED_CMD => SOCKS5_REP_CMD_NOT_SUPPORTED,
-        reject_codes::PROTOCOL_ERROR => SOCKS5_REP_GENERAL_FAILURE,
-        _ => SOCKS5_REP_GENERAL_FAILURE,
-    }
 }
