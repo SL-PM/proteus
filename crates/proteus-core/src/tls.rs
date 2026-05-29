@@ -56,6 +56,9 @@ pub fn install_crypto_provider() {
 /// - Leaves connection migration ON (Quinn default). PROTEUS's
 ///   replay cache is keyed on `client_id` not 5-tuple, so a migration
 ///   doesn't disturb the auth state. See `docs/m7.4-connection-migration.md`.
+/// - No keepalive here. [`client_config`] adds a client-only
+///   `keep_alive_interval` so idle tunnels survive; the server keeps the
+///   bare idle timeout so dead clients are still reclaimed.
 pub fn default_transport_config() -> quinn::TransportConfig {
     let mut tc = quinn::TransportConfig::default();
     tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
@@ -119,7 +122,14 @@ pub fn client_config(pin_sha256_hex: &str) -> Result<quinn::ClientConfig> {
     let mut ccfg = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_cfg)?,
     ));
-    ccfg.transport_config(Arc::new(default_transport_config()));
+    // Client sends QUIC keepalives so an idle tunnel survives the 30s
+    // idle timeout: a PING every 10s resets the server's idle timer, and
+    // the ACKs it draws back reset the client's own. The server itself
+    // deliberately does NOT keepalive — a silent/dead client still times
+    // out after 30s, preserving the slow-loris bound (M18).
+    let mut tc = default_transport_config();
+    tc.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+    ccfg.transport_config(Arc::new(tc));
     Ok(ccfg)
 }
 
