@@ -60,10 +60,22 @@ pub fn install_crypto_provider() {
 ///   `keep_alive_interval` so idle tunnels survive; the server keeps the
 ///   bare idle timeout so dead clients are still reclaimed.
 pub fn default_transport_config() -> quinn::TransportConfig {
+    use quinn::VarInt;
     let mut tc = quinn::TransportConfig::default();
-    tc.max_idle_timeout(Some(quinn::IdleTimeout::from(quinn::VarInt::from_u32(
-        30_000,
-    ))));
+    tc.max_idle_timeout(Some(quinn::IdleTimeout::from(VarInt::from_u32(30_000))));
+
+    // v0.6 throughput tuning. Quinn's default (CUBIC) collapses on a lossy
+    // consumer download path — the server is the *sender* for downloads, so
+    // this matters most server-side. BBR keeps the pipe full under mild
+    // loss. The default flow-control windows are also too small for real
+    // internet RTTs, so raise them: 4 MiB/stream and 16 MiB/connection
+    // cover ~500 Mbit/s at 64 ms RTT (windows are caps, not preallocations).
+    tc.congestion_controller_factory(std::sync::Arc::new(
+        quinn::congestion::BbrConfig::default(),
+    ));
+    tc.stream_receive_window(VarInt::from_u32(4 * 1024 * 1024));
+    tc.receive_window(VarInt::from_u32(16 * 1024 * 1024));
+    tc.send_window(16 * 1024 * 1024);
     tc
 }
 
