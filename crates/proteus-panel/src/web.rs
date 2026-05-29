@@ -1,9 +1,11 @@
-//! Server-rendered admin web UI (v0.6 M4.6).
+//! Server-rendered admin web UI (v0.6 M4.6 + M5.6).
 //!
 //! Plain HTML + form posts (no JS build chain): login, client list,
 //! add-client (shows the generated private key once), enable/disable,
-//! delete. Sits alongside the JSON API ([`crate::api`]) and shares its
-//! session machinery. Subscription links + QR codes land in M5.6.
+//! delete. M5.6 adds a settings page for the public server endpoint and,
+//! on the client-created page, a one-click `proteus://` subscription link
+//! plus an inline QR code. Sits alongside the JSON API ([`crate::api`])
+//! and shares its session machinery.
 
 use axum::{
     Form, async_trait,
@@ -13,13 +15,14 @@ use axum::{
     routing::{get, post},
 };
 use axum_extra::extract::cookie::CookieJar;
-use maud::{DOCTYPE, Markup, html};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
+use proteus_core::subscription::Subscription;
 use serde::Deserialize;
 
 use crate::{
     api::{AppState, SESSION_COOKIE, generate_keypair, random_id, session_cookie},
     auth,
-    db::Client,
+    db::{Client, SubEndpoint},
 };
 
 /// Web auth guard: redirects to `/login` instead of returning 401.
@@ -62,6 +65,13 @@ struct AddForm {
     quota_gb: String,
     /// Expiry as `YYYY-MM-DD` (empty = never).
     expires: String,
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    server_addr: String,
+    sni: String,
+    cert_sha256: String,
 }
 
 // ----------------- handlers -----------------
@@ -120,8 +130,49 @@ async fn add_client(_: WebAuth, State(st): State<AppState>, Form(f): Form<AddFor
         )
         .await
     {
-        Ok(()) => page_created(&id, &pub_b64, &priv_b64).into_response(),
+        Ok(()) => {
+            // Stamp the stored endpoint into a one-click subscription link
+            // (only possible once the endpoint is configured, M5.6).
+            let ep = st.db.get_sub_endpoint().await.unwrap_or_default();
+            let sub_url = ep.is_configured().then(|| {
+                Subscription {
+                    server_addr: ep.server_addr,
+                    sni: ep.sni,
+                    cert_sha256: ep.cert_sha256,
+                    client_id: id.clone(),
+                    private_key_b64: priv_b64.clone(),
+                    label: f.label.trim().to_string(),
+                }
+                .to_url()
+            });
+            page_created(&id, &pub_b64, &priv_b64, sub_url.as_deref()).into_response()
+        }
         Err(e) => page_error(&format!("Anlegen fehlgeschlagen: {e}")).into_response(),
+    }
+}
+
+async fn settings_page(_: WebAuth, State(st): State<AppState>) -> Markup {
+    let ep = st.db.get_sub_endpoint().await.unwrap_or_default();
+    page_settings(&ep, false)
+}
+
+async fn settings_post(
+    _: WebAuth,
+    State(st): State<AppState>,
+    Form(f): Form<SettingsForm>,
+) -> Response {
+    let ep = SubEndpoint {
+        server_addr: f.server_addr,
+        sni: f.sni,
+        cert_sha256: f.cert_sha256,
+    };
+    match st.db.set_sub_endpoint(&ep).await {
+        // Re-read so the form shows the trimmed, persisted values.
+        Ok(()) => {
+            let saved = st.db.get_sub_endpoint().await.unwrap_or(ep);
+            page_settings(&saved, true).into_response()
+        }
+        Err(e) => page_error(&format!("Speichern fehlgeschlagen: {e}")).into_response(),
     }
 }
 
@@ -171,6 +222,20 @@ fn human_bytes(n: i64) -> String {
     } else {
         format!("{n} B")
     }
+}
+
+/// Render `data` as an inline SVG QR code, or `None` if it won't encode.
+/// Low EC level maximizes capacity for the long subscription URL.
+fn qr_svg(data: &str) -> Option<String> {
+    use qrcode::{EcLevel, QrCode, render::svg};
+    let code = QrCode::with_error_correction_level(data.as_bytes(), EcLevel::L).ok()?;
+    Some(
+        code.render::<svg::Color>()
+            .min_dimensions(220, 220)
+            .dark_color(svg::Color("#000000"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+    )
 }
 
 // ----------------- pages (maud) -----------------
@@ -226,8 +291,12 @@ fn page_clients(clients: &[Client]) -> Markup {
         html! {
             div style="display:flex;justify-content:space-between;align-items:center" {
                 h1 { "Clients (" (clients.len()) ")" }
-                form .inline method="post" action="/logout" {
-                    button type="submit" { "Abmelden" }
+                div {
+                    a href="/settings" { "Einstellungen" }
+                    "  "
+                    form .inline method="post" action="/logout" {
+                        button type="submit" { "Abmelden" }
+                    }
                 }
             }
 
@@ -297,11 +366,33 @@ fn page_clients(clients: &[Client]) -> Markup {
     )
 }
 
-fn page_created(id: &str, pub_b64: &str, priv_b64: &str) -> Markup {
+fn page_created(id: &str, pub_b64: &str, priv_b64: &str, sub_url: Option<&str>) -> Markup {
     layout(
         "Client angelegt",
         html! {
             h1 { "Client angelegt" }
+
+            @match sub_url {
+                Some(url) => {
+                    div .card {
+                        h2 style="font-size:1.1rem;margin-top:0" { "Subscription — 1-Klick-Import" }
+                        p .muted { "Im PROTEUS-Client einfügen oder QR scannen. Der Link enthält den privaten Schlüssel — wie ein Passwort behandeln." }
+                        @if let Some(svg) = qr_svg(url) {
+                            div style="background:#fff;display:inline-block;padding:10px;border-radius:.5rem;margin:.4rem 0" {
+                                (PreEscaped(svg))
+                            }
+                        }
+                        p { code { (url) } }
+                    }
+                }
+                None => {
+                    div .card {
+                        p .danger { "Kein Subscription-Link: Server-Endpoint nicht konfiguriert." }
+                        p { a href="/settings" { "→ Endpoint in den Einstellungen setzen" } }
+                    }
+                }
+            }
+
             div .card {
                 p { "Client-ID: " code { (id) } }
                 p { "Public Key: " code { (pub_b64) } }
@@ -310,6 +401,39 @@ fn page_created(id: &str, pub_b64: &str, priv_b64: &str) -> Markup {
                 p .muted { "Diesen privaten Schlüssel dem Kunden geben; er wird nicht gespeichert." }
             }
             p { a href="/" { "← Zurück zur Liste" } }
+        },
+    )
+}
+
+fn page_settings(ep: &SubEndpoint, saved: bool) -> Markup {
+    layout(
+        "Einstellungen",
+        html! {
+            div style="display:flex;justify-content:space-between;align-items:center" {
+                h1 { "Einstellungen" }
+                p { a href="/" { "← Clients" } }
+            }
+            @if saved { p style="color:#0a0" { "Gespeichert." } }
+            div .card {
+                h2 style="font-size:1.1rem;margin-top:0" { "Server-Endpoint für Subscriptions" }
+                p .muted { "Diese Werte werden in jeden proteus://-Link gestempelt, den der Client importiert." }
+                form method="post" action="/settings" {
+                    p {
+                        label { "Server-Adresse (host:port)" } br;
+                        input type="text" name="server_addr" style="width:100%" value=(ep.server_addr) placeholder="212.227.12.251:4433";
+                    }
+                    p {
+                        label { "TLS SNI" } br;
+                        input type="text" name="sni" style="width:100%" value=(ep.sni) placeholder="localhost";
+                    }
+                    p {
+                        label { "Cert-SHA256-Pin (hex, leer = beliebig/Labor)" } br;
+                        input type="text" name="cert_sha256" style="width:100%" value=(ep.cert_sha256) placeholder="2902a743b97e…";
+                    }
+                    p { button type="submit" { "Speichern" } }
+                }
+                p .muted { "Pin-Quelle: Server-Log beim Start bzw. client.yaml (cert_sha256). Hinweis: Das Server-Zertifikat wird derzeit bei jedem Neustart neu erzeugt — danach den Pin hier aktualisieren; bereits verteilte Links brechen dann (persistentes Zertifikat folgt später)." }
+            }
         },
     )
 }
@@ -331,6 +455,7 @@ pub(crate) fn add_routes(router: axum::Router<AppState>) -> axum::Router<AppStat
         .route("/", get(home))
         .route("/login", get(login_page).post(login_post))
         .route("/logout", post(logout_post))
+        .route("/settings", get(settings_page).post(settings_post))
         .route("/clients", post(add_client))
         .route("/clients/:id/enable", post(enable))
         .route("/clients/:id/disable", post(disable))

@@ -80,6 +80,39 @@ CREATE TABLE IF NOT EXISTS admins (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );";
 
+/// Free-form key/value panel settings (M5.6). Holds the public server
+/// endpoint the panel stamps into subscription links.
+const SCHEMA_SETTINGS: &str = "\
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);";
+
+// Setting keys for the subscription endpoint (M5.6).
+const KEY_SERVER_ADDR: &str = "sub.server_addr";
+const KEY_SNI: &str = "sub.sni";
+const KEY_CERT_SHA256: &str = "sub.cert_sha256";
+
+/// The public PROTEUS endpoint the panel stamps into `proteus://` links.
+/// Lives in `settings` so an admin can edit it in the panel (no restart).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SubEndpoint {
+    /// `host:port` clients dial (e.g. `212.227.12.251:4433`).
+    pub server_addr: String,
+    /// TLS SNI to present.
+    pub sni: String,
+    /// Lowercase-hex SHA-256 pin of the server leaf cert (empty = accept
+    /// any, lab only).
+    pub cert_sha256: String,
+}
+
+impl SubEndpoint {
+    /// Usable only once a `server_addr` is configured.
+    pub fn is_configured(&self) -> bool {
+        !self.server_addr.is_empty()
+    }
+}
+
 /// Handle to the SQLite-backed client store.
 #[derive(Clone)]
 pub struct Db {
@@ -106,6 +139,10 @@ impl Db {
             .execute(&pool)
             .await
             .context("apply admins schema")?;
+        sqlx::query(SCHEMA_SETTINGS)
+            .execute(&pool)
+            .await
+            .context("apply settings schema")?;
         Ok(Self { pool })
     }
 
@@ -242,6 +279,47 @@ impl Db {
             .context("count admins")?;
         Ok(n)
     }
+
+    /// Read one setting value, or `None` if unset.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .with_context(|| format!("get_setting {key}"))?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    /// Upsert one setting value.
+    pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("set_setting {key}"))?;
+        Ok(())
+    }
+
+    /// Load the subscription endpoint (M5.6). Always returns a struct;
+    /// unset keys come back empty. Check [`SubEndpoint::is_configured`].
+    pub async fn get_sub_endpoint(&self) -> Result<SubEndpoint> {
+        Ok(SubEndpoint {
+            server_addr: self.get_setting(KEY_SERVER_ADDR).await?.unwrap_or_default(),
+            sni: self.get_setting(KEY_SNI).await?.unwrap_or_default(),
+            cert_sha256: self.get_setting(KEY_CERT_SHA256).await?.unwrap_or_default(),
+        })
+    }
+
+    /// Persist the subscription endpoint (values stored trimmed).
+    pub async fn set_sub_endpoint(&self, ep: &SubEndpoint) -> Result<()> {
+        self.set_setting(KEY_SERVER_ADDR, ep.server_addr.trim())
+            .await?;
+        self.set_setting(KEY_SNI, ep.sni.trim()).await?;
+        self.set_setting(KEY_CERT_SHA256, ep.cert_sha256.trim())
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +417,37 @@ mod tests {
             db.get_admin_hash("admin").await.unwrap().as_deref(),
             Some("$argon2id$hash2")
         );
+    }
+
+    #[tokio::test]
+    async fn settings_and_sub_endpoint() {
+        let (_d, db) = temp_db().await;
+
+        // Unset → empty struct, not configured.
+        assert!(db.get_setting("nope").await.unwrap().is_none());
+        let ep = db.get_sub_endpoint().await.unwrap();
+        assert!(!ep.is_configured());
+        assert_eq!(ep, SubEndpoint::default());
+
+        // Plain key/value upsert.
+        db.set_setting("k", "v1").await.unwrap();
+        assert_eq!(db.get_setting("k").await.unwrap().as_deref(), Some("v1"));
+        db.set_setting("k", "v2").await.unwrap();
+        assert_eq!(db.get_setting("k").await.unwrap().as_deref(), Some("v2"));
+
+        // Endpoint round-trip; values are stored trimmed.
+        db.set_sub_endpoint(&SubEndpoint {
+            server_addr: "  212.227.12.251:4433 ".into(),
+            sni: "localhost".into(),
+            cert_sha256: "  abcd1234 ".into(),
+        })
+        .await
+        .unwrap();
+        let ep = db.get_sub_endpoint().await.unwrap();
+        assert!(ep.is_configured());
+        assert_eq!(ep.server_addr, "212.227.12.251:4433");
+        assert_eq!(ep.sni, "localhost");
+        assert_eq!(ep.cert_sha256, "abcd1234");
     }
 
     #[test]

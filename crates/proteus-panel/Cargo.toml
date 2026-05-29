@@ -21,6 +21,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # M4.6: server-rendered admin UI (compile-time HTML, no JS build chain).
 maud = { version = "0.26", features = ["axum"] }
 proteus-core = { path = "../proteus-core" }
+# M5.6: QR codes for subscription links. SVG renderer only (no `image`
+# crate) → embed the SVG string straight into the maud page.
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 # M1.6: SQLite client store. Runtime query API (no compile-time DATABASE_URL

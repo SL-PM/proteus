@@ -7,6 +7,7 @@ members = [
     "crates/proteus-client-core",
     "crates/proteus-tools",
     "crates/proteus-panel",
+    "crates/proteus-app",
 ]
 
 [workspace.package]

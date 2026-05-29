@@ -1,0 +1,19 @@
+[package]
+name = "proteus-app"
+version = "0.6.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# v0.6 client app: a Tauri desktop GUI (Hiddify-style) that imports a
+# `proteus://` subscription, connects via proteus-client-core, and shows
+# live up/down speed + ping. Same engine as the CLI; the UI is vanilla
+# JS over `withGlobalTauri` (no JS build chain).
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+proteus-client-core = { path = "../proteus-client-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PROTEUS</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="brand">
+        <div class="logo">P</div>
+        <div class="title">
+          <h1>PROTEUS</h1>
+          <span class="tag">v0.6 client</span>
+        </div>
+        <div id="dot" class="dot off" title="disconnected"></div>
+      </header>
+
+      <section class="card import">
+        <label for="sub">Subscription</label>
+        <textarea
+          id="sub"
+          rows="3"
+          spellcheck="false"
+          placeholder="proteus://…  (paste the link from your panel)"
+        ></textarea>
+        <div class="row">
+          <div class="field">
+            <label for="port">SOCKS5 port</label>
+            <input id="port" type="number" min="1" max="65535" value="1080" />
+          </div>
+          <button id="action" class="primary">Connect</button>
+        </div>
+      </section>
+
+      <section class="card gauges">
+        <div class="gauge">
+          <span class="g-label">Download</span>
+          <span id="down" class="g-value">—</span>
+        </div>
+        <div class="gauge">
+          <span class="g-label">Upload</span>
+          <span id="up" class="g-value">—</span>
+        </div>
+        <div class="gauge">
+          <span class="g-label">Ping</span>
+          <span id="ping" class="g-value">—</span>
+        </div>
+      </section>
+
+      <section class="card meta">
+        <div class="meta-row">
+          <span>Status</span><span id="status">Idle</span>
+        </div>
+        <div class="meta-row">
+          <span>SOCKS5</span><span id="addr">—</span>
+        </div>
+        <div class="meta-row">
+          <span>Transferred</span><span id="totals">↓ 0 B · ↑ 0 B</span>
+        </div>
+      </section>
+
+      <p id="err" class="err"></p>
+      <p class="hint">
+        Point your browser/system proxy at the SOCKS5 address above.
+      </p>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>
