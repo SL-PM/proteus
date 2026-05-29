@@ -208,8 +208,9 @@ pub async fn connect(cfg: ClientConfig) -> Result<RunningClient> {
 }
 
 /// Dial from a `proteus://…` subscription blob (one-click import), with
-/// the SOCKS5 listener on `socks5_listen`. Shaping defaults off (the
-/// blob carries only the credential + endpoint for now).
+/// the SOCKS5 listener on `socks5_listen`. DPI camouflage is ON by default
+/// for subscription clients (bucket padding + light timing jitter on the
+/// upload direction); the server shapes the download direction itself.
 pub async fn connect_subscription(url: &str, socks5_listen: SocketAddr) -> Result<RunningClient> {
     let sub = Subscription::from_url(url)?;
     let sk = parse_signing_key_b64(&sub.private_key_b64)?;
@@ -219,6 +220,15 @@ pub async fn connect_subscription(url: &str, socks5_listen: SocketAddr) -> Resul
             sub.server_addr
         )
     })?;
+    // v0.6 DPI camouflage: subscription clients shape by default — bucket-
+    // pad the upload direction + light timing jitter (small range + burst,
+    // so bulk throughput is barely affected). The server shapes the
+    // download direction via its own config; receivers auto-depad, so no
+    // negotiation is needed.
+    let pad_buckets = Some(std::sync::Arc::new(
+        proteus_core::padding::DEFAULT_BUCKETS.to_vec(),
+    ));
+    let jitter = Some(JitterPlan::new(Jitter::new(0, 1), 64));
     connect_inner(ConnectParams {
         server_addr,
         sni: sub.sni,
@@ -226,8 +236,8 @@ pub async fn connect_subscription(url: &str, socks5_listen: SocketAddr) -> Resul
         client_id: sub.client_id,
         sk,
         socks5_listen,
-        pad_buckets: None,
-        jitter: None,
+        pad_buckets,
+        jitter,
         profile_dist: None,
     })
     .await
