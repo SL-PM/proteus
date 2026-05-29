@@ -23,7 +23,9 @@ const errEl = el("err");
 let connected = false;
 let busy = false;
 let sysActive = false;
+let reconnecting = false;
 let pollTimer = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function fmtBytes(n) {
   if (!n) return "0 B";
@@ -82,22 +84,42 @@ function renderStats(s) {
   actionEl.classList.add("danger");
 }
 
-// Link dropped under us: tear down + restore the system proxy so the
-// browser never gets stranded pointing at a dead listener.
+// Link dropped under us: try to re-dial transparently (keeping the system
+// proxy in place — the listener rebinds the same port) with backoff. Only
+// if every attempt fails do we tear down and restore the proxy, so the
+// browser isn't stranded on a dead listener.
 async function handleDrop() {
+  if (reconnecting) return;
+  reconnecting = true;
   stopPolling();
+  dotEl.className = "dot warn";
+  dotEl.title = "reconnecting";
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    statusEl.textContent = `Reconnecting… (${attempt}/6)`;
+    setError("Verbindung verloren — verbinde neu…");
+    await sleep(attempt === 1 ? 600 : 3000);
+    try {
+      const ok = await invoke("reconnect");
+      if (ok) {
+        setError("");
+        reconnecting = false;
+        startPolling();
+        return;
+      }
+    } catch (e) {
+      /* keep retrying until the attempt budget is spent */
+    }
+  }
+  // Gave up: restore the proxy + go idle so traffic isn't black-holed.
+  reconnecting = false;
   try {
     await invoke("disconnect");
   } catch (e) {
     /* best effort */
   }
-  const msg =
-    "Verbindung verloren — getrennt" +
-    (sysActive ? " (System-Proxy zurückgesetzt)" : "") +
-    ".";
   sysActive = false;
   renderIdle();
-  setError(msg);
+  setError("Konnte nicht neu verbinden — getrennt.");
 }
 
 async function poll() {

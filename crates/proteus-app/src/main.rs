@@ -30,6 +30,10 @@ struct AppState {
     client: Mutex<Option<RunningClient>>,
     /// `Some` while we've taken over the system proxy.
     proxy: Mutex<Option<sysproxy::Saved>>,
+    /// Last successful connect params (sub_url, socks5_port), so a dropped
+    /// link can be re-dialed transparently without re-prompting for the
+    /// proxy.
+    last: Mutex<Option<(String, u16)>>,
 }
 
 /// Serializable mirror of `proteus_client_core::Stats` for the webview.
@@ -87,6 +91,7 @@ async fn connect(
         .map_err(|e| format!("{e:#}"))?;
     let addr = client.socks5_addr();
     *state.client.lock().expect("client lock") = Some(client);
+    *state.last.lock().expect("last lock") = Some((sub_url.trim().to_string(), socks5_port));
 
     let mut res = ConnectResult {
         socks5_addr: addr.to_string(),
@@ -112,6 +117,7 @@ async fn connect(
 /// link down.
 #[tauri::command]
 async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
+    *state.last.lock().expect("last lock") = None;
     if let Some(saved) = take_saved(&state) {
         let _ = tauri::async_runtime::spawn_blocking(move || sysproxy::restore(&saved)).await;
     }
@@ -120,6 +126,30 @@ async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
         c.stop().await;
     }
     Ok(())
+}
+
+/// Re-dial the last connection after a drop, WITHOUT touching the system
+/// proxy: the listener rebinds the same port, so routing is unchanged and
+/// macOS doesn't re-prompt. Returns `true` on success. The UI calls this
+/// (with backoff) instead of tearing everything down on a transient blip.
+#[tauri::command]
+async fn reconnect(state: State<'_, AppState>) -> Result<bool, String> {
+    let last = state.last.lock().expect("last lock").clone();
+    let Some((sub_url, port)) = last else {
+        return Err("nichts zum Wiederverbinden".into());
+    };
+    let prev = state.client.lock().expect("client lock").take();
+    if let Some(c) = prev {
+        c.stop().await;
+    }
+    let listen: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| format!("bad port {port}: {e}"))?;
+    let client = connect_subscription(sub_url.trim(), listen)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    *state.client.lock().expect("client lock") = Some(client);
+    Ok(true)
 }
 
 /// Current link stats, or `None` (→ JS `null`) when not connected.
@@ -143,7 +173,7 @@ fn get_stats(state: State<'_, AppState>) -> Option<StatsDto> {
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![connect, disconnect, get_stats])
+        .invoke_handler(tauri::generate_handler![connect, disconnect, reconnect, get_stats])
         .build(tauri::generate_context!())
         .expect("error building PROTEUS app")
         .run(|app, event| {
