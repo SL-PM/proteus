@@ -1,14 +1,15 @@
 // PROTEUS desktop UI — vanilla JS over `withGlobalTauri`.
 //
-// Talks to the three Rust commands (connect / disconnect / get_stats).
-// Tauri maps JS camelCase args to Rust snake_case (subUrl → sub_url,
-// socks5Port → socks5_port). Stats are polled once a second.
+// Talks to connect / disconnect / get_stats. Tauri maps JS camelCase args
+// to Rust snake_case (subUrl→sub_url, socks5Port→socks5_port,
+// systemProxy→system_proxy). Stats polled once a second.
 
 const { invoke } = window.__TAURI__.core;
 
 const el = (id) => document.getElementById(id);
 const subEl = el("sub");
 const portEl = el("port");
+const sysproxyEl = el("sysproxy");
 const actionEl = el("action");
 const dotEl = el("dot");
 const statusEl = el("status");
@@ -21,6 +22,7 @@ const errEl = el("err");
 
 let connected = false;
 let busy = false;
+let sysActive = false;
 let pollTimer = null;
 
 function fmtBytes(n) {
@@ -65,8 +67,12 @@ function renderStats(s) {
   const live = s.connected;
   dotEl.className = live ? "dot on" : "dot warn";
   dotEl.title = live ? "connected" : "link closed";
-  statusEl.textContent = live ? "Connected" : "Link closed";
-  addrEl.textContent = s.socks5_addr;
+  statusEl.textContent = live
+    ? sysActive
+      ? "Connected · systemweit"
+      : "Connected"
+    : "Link closed";
+  addrEl.textContent = s.socks5_addr + (sysActive ? "  · systemweit" : "");
   downEl.textContent = fmtRate(s.down_bps);
   upEl.textContent = fmtRate(s.up_bps);
   pingEl.textContent = `${Math.round(s.ping_ms)} ms`;
@@ -76,12 +82,33 @@ function renderStats(s) {
   actionEl.classList.add("danger");
 }
 
+// Link dropped under us: tear down + restore the system proxy so the
+// browser never gets stranded pointing at a dead listener.
+async function handleDrop() {
+  stopPolling();
+  try {
+    await invoke("disconnect");
+  } catch (e) {
+    /* best effort */
+  }
+  const msg =
+    "Verbindung verloren — getrennt" +
+    (sysActive ? " (System-Proxy zurückgesetzt)" : "") +
+    ".";
+  sysActive = false;
+  renderIdle();
+  setError(msg);
+}
+
 async function poll() {
   try {
     const s = await invoke("get_stats");
+    if (s && !s.connected) {
+      await handleDrop();
+      return;
+    }
     renderStats(s);
   } catch (e) {
-    // Non-fatal: keep last frame, surface the message.
     setError(String(e));
   }
 }
@@ -106,16 +133,20 @@ async function doConnect() {
     return;
   }
   const socks5Port = parseInt(portEl.value, 10) || 1080;
+  const systemProxy = !!sysproxyEl.checked;
   busy = true;
   setError("");
   statusEl.textContent = "Connecting…";
   actionEl.disabled = true;
   try {
-    const addr = await invoke("connect", { subUrl, socks5Port });
-    addrEl.textContent = addr;
+    const res = await invoke("connect", { subUrl, socks5Port, systemProxy });
+    sysActive = !!res.system_proxy;
+    addrEl.textContent = res.socks5_addr + (sysActive ? "  · systemweit" : "");
+    if (res.note) setError(res.note);
     startPolling();
   } catch (e) {
     setError(String(e));
+    sysActive = false;
     renderIdle();
   } finally {
     busy = false;
@@ -133,6 +164,7 @@ async function doDisconnect() {
   } catch (e) {
     setError(String(e));
   } finally {
+    sysActive = false;
     renderIdle();
     busy = false;
     actionEl.disabled = false;

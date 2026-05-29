@@ -137,6 +137,22 @@ input:focus {
   width: 130px;
 }
 
+.chk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.chk input {
+  width: auto;
+  accent-color: var(--accent);
+  flex: none;
+}
+
 button {
   flex: 1;
   border: 0;

@@ -32,6 +32,10 @@
           </div>
           <button id="action" class="primary">Connect</button>
         </div>
+        <label class="chk">
+          <input type="checkbox" id="sysproxy" checked />
+          <span>Systemweit routen (Auto-Proxy) — alle Apps gehen durch PROTEUS</span>
+        </label>
       </section>
 
       <section class="card gauges">
@@ -63,7 +67,9 @@
 
       <p id="err" class="err"></p>
       <p class="hint">
-        Point your browser/system proxy at the SOCKS5 address above.
+        Auto-Proxy an: alle Apps gehen automatisch durch PROTEUS (macOS
+        fragt einmal nach dem Admin-Passwort). Aus: Proxy manuell auf die
+        SOCKS5-Adresse oben zeigen.
       </p>
     </main>
 
